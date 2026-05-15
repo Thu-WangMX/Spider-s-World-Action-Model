@@ -148,6 +148,8 @@ class FastWAM_DINO(nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        video_dit_init_from_wan: bool = False,
+        wan_model_id: str = "Wan-AI/Wan2.2-TI2V-5B",
     ):
         """Create FastWAM_DINO from configuration dicts."""
 
