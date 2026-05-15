@@ -324,6 +324,8 @@ def create_fastwam_dino(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        video_dit_init_from_wan=bool(video_dit_init_from_wan),
+        wan_model_id=str(wan_model_id),
     )
 
 def create_fastwam_idm(

@@ -155,6 +155,48 @@ class DinoVideoDiT(nn.Module):
         if use_gradient_checkpointing:
             logger.info("DinoVideoDiT: gradient checkpointing enabled.")
 
+    def init_from_wan_dit(self, wan_dit_state_dict: dict[str, torch.Tensor]) -> None:
+        """Initialize DinoVideoDiT Transformer layers from a Wan2.2 Video DiT state_dict.
+
+        Copies weights for: blocks.*, text_embedding.*, time_embedding.*,
+        time_projection.*.  Skips input_projection, head, freqs (which are
+        architecture-specific to the DINO variant).
+
+        Args:
+            wan_dit_state_dict: state_dict from a WanVideoDiT instance
+                (e.g. loaded via ``load_wan22_ti2v_5b_components``).
+        """
+        transferable_prefixes = ("blocks.", "text_embedding.", "time_embedding.", "time_projection.")
+        own_state = self.state_dict()
+
+        copied, skipped_missing, skipped_shape = 0, 0, 0
+        for key, wan_tensor in wan_dit_state_dict.items():
+            if not any(key.startswith(p) for p in transferable_prefixes):
+                continue
+            if key not in own_state:
+                skipped_missing += 1
+                continue
+            if own_state[key].shape != wan_tensor.shape:
+                logger.warning(
+                    f"Shape mismatch for '{key}': "
+                    f"DinoVideoDiT={tuple(own_state[key].shape)}, "
+                    f"WanVideoDiT={tuple(wan_tensor.shape)}. Skipping."
+                )
+                skipped_shape += 1
+                continue
+            own_state[key] = wan_tensor
+
+        self.load_state_dict(own_state, strict=True)
+        total_transferable = sum(
+            1 for k in wan_dit_state_dict if any(k.startswith(p) for p in transferable_prefixes)
+        )
+        copied = total_transferable - skipped_missing - skipped_shape
+        logger.info(
+            f"DinoVideoDiT initialized from Wan2.2 DiT: "
+            f"copied={copied}, skipped_missing={skipped_missing}, "
+            f"skipped_shape={skipped_shape}"
+        )
+
     def build_video_to_video_mask(
         self,
         video_seq_len: int,

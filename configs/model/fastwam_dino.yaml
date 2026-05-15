@@ -7,6 +7,12 @@ mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
 
+# Optional: initialize DinoVideoDiT Transformer layers from Wan2.2 Video DiT
+# This copies blocks.*, text_embedding.*, time_embedding.*, time_projection.*
+# Only input_projection and head remain randomly initialized
+video_dit_init_from_wan: false
+wan_model_id: "Wan-AI/Wan2.2-TI2V-5B"
+
 # DINO encoder config (frozen) — DINOv3-ViT-L/16
 dino_config:
   model_name: "dinov3-vitl16"

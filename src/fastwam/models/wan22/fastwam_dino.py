@@ -180,6 +180,45 @@ class FastWAM_DINO(nn.Module):
             use_gradient_checkpointing=video_dit_config.get("use_gradient_checkpointing", True),
         ).to(device=device, dtype=torch_dtype)
 
+        # Optionally initialize DinoVideoDiT from Wan2.2 Video DiT weights
+        if video_dit_init_from_wan:
+            from .helpers.loader import load_wan22_ti2v_5b_components
+
+            wan_dit_config = {
+                "has_image_input": False,
+                "patch_size": [1, 2, 2],
+                "in_dim": 48,
+                "hidden_dim": video_dit_config["hidden_dim"],
+                "ffn_dim": video_dit_config["ffn_dim"],
+                "freq_dim": video_dit_config.get("freq_dim", 256),
+                "text_dim": video_dit_config.get("text_dim", text_dim),
+                "out_dim": 48,
+                "num_heads": video_dit_config["num_heads"],
+                "attn_head_dim": video_dit_config["attn_head_dim"],
+                "num_layers": video_dit_config["num_layers"],
+                "eps": video_dit_config.get("eps", 1e-6),
+                "seperated_timestep": True,
+                "require_clip_embedding": False,
+                "require_vae_embedding": False,
+                "fuse_vae_embedding_in_latents": True,
+                "video_attention_mask_mode": "first_frame_causal",
+                "action_conditioned": False,
+            }
+            logger.info(f"Loading Wan2.2 DiT from '{wan_model_id}' to initialize DinoVideoDiT...")
+            wan_components = load_wan22_ti2v_5b_components(
+                device=device,
+                torch_dtype=torch_dtype,
+                model_id=wan_model_id,
+                tokenizer_model_id=tokenizer_model_id,
+                tokenizer_max_len=tokenizer_max_len,
+                redirect_common_files=True,
+                dit_config=wan_dit_config,
+                skip_dit_load_from_pretrain=False,
+                load_text_encoder=False,
+            )
+            video_expert.init_from_wan_dit(wan_components.dit.state_dict())
+            del wan_components  # free memory
+
         # Build Action Expert
         action_expert = ActionDiT.from_pretrained(
             action_dit_config=action_dit_config,
