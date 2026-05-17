@@ -1,8 +1,13 @@
 """Utils for evaluating policies in LIBERO simulation environments."""
 
 import math
+import os
 import time
 import pathlib
+
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
 import imageio
 from PIL import Image, ImageDraw

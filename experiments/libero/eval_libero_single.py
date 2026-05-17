@@ -16,14 +16,22 @@ from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from tqdm import tqdm
 
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+# LIBERO init-state files are pickled with older PyTorch behavior.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
 # try:
 #     import rootutils
 
 #     rootutils.setup_root(__file__, indicator=".python-version", pythonpath=True)
 # except ModuleNotFoundError:
 project_root = Path(__file__).resolve().parents[2]
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
+project_src = project_root / "src"
+for path in (project_src, project_root):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 from experiments.libero.libero_utils import (
     LIBERO_ENV_RESOLUTION,
@@ -150,6 +158,13 @@ def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
         len(missing),
         len(unexpected),
     )
+
+
+def _filter_call_kwargs(fn, kwargs: dict[str, Any]) -> dict[str, Any]:
+    signature = inspect.signature(fn)
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in signature.parameters}
 
 
 def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -412,10 +427,10 @@ def _predict_action_chunk(
 
     with torch.no_grad():
         if visualize_future_video:
-            pred = model.infer_joint(**infer_kwargs)
+            pred = model.infer_joint(**_filter_call_kwargs(model.infer_joint, infer_kwargs))
             predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
         else:
-            pred = model.infer_action(**infer_kwargs)
+            pred = model.infer_action(**_filter_call_kwargs(model.infer_action, infer_kwargs))
     action = pred["action"]  # [T, D]
 
     action = _denormalize_action(action, processor)[0]  # [T, D]

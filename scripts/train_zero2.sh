@@ -19,6 +19,17 @@ if ! is_integer "${NUM_MACHINES}" || ! is_integer "${MACHINE_RANK}"; then
   exit 1
 fi
 
+if [[ "${WAIT_FOR_GPUS:-1}" != "0" ]]; then
+  echo "[wait_for_gpus] enabled for training; set WAIT_FOR_GPUS=0 to skip."
+  SELECTED_GPUS="$(
+    "${PYTHON:-python3}" scripts/wait_for_gpus.py \
+      --count "${NPROC_PER_NODE}" \
+      --visible "${CUDA_VISIBLE_DEVICES:-}"
+  )"
+  export CUDA_VISIBLE_DEVICES="${SELECTED_GPUS}"
+  echo "[wait_for_gpus] selected CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+fi
+
 extract_task_basename() {
   local cfg="$1"
   if [[ "${cfg}" == task/* ]]; then

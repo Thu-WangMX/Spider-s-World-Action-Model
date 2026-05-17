@@ -27,6 +27,8 @@ run_libero_eval() {
     SESSION_NAME="libero_test_v3"
     EXP_NAME=${EXP_NAME:-""}
     export EXP_NAME
+    PYTHON_BIN=${PYTHON:-python}
+    export PYTHON_BIN
 
     echo "EXP_NAME: $EXP_NAME"
     
@@ -51,6 +53,20 @@ run_libero_eval() {
     fi
     export NUM_GPUS
     echo "NUM_GPUS: $NUM_GPUS, AVAILABLE_GPUS: $AVAILABLE_GPUS"
+
+    if [ "${WAIT_FOR_GPUS:-1}" != "0" ]; then
+        echo "[wait_for_gpus] enabled for LIBERO eval; set WAIT_FOR_GPUS=0 to skip."
+        SELECTED_GPUS=$(
+            "${PYTHON:-python3}" scripts/wait_for_gpus.py \
+                --count "$NUM_GPUS" \
+                --visible "$AVAILABLE_GPUS"
+        )
+        AVAILABLE_GPUS="$SELECTED_GPUS"
+        NUM_GPUS=$(echo "$AVAILABLE_GPUS" | tr ',' '\n' | sed '/^$/d' | wc -l)
+        export NUM_GPUS
+        export CUDA_VISIBLE_DEVICES="$AVAILABLE_GPUS"
+        echo "[wait_for_gpus] selected AVAILABLE_GPUS=$AVAILABLE_GPUS"
+    fi
 
     # Convert AVAILABLE_GPUS to an array
     IFS=',' read -r -a GPU_ARRAY <<< "$AVAILABLE_GPUS"
@@ -337,7 +353,7 @@ run_libero_eval() {
         tmux send-keys -t $SESSION_NAME:$pane_info "clear" C-m 2>/dev/null
         tmux send-keys -t $SESSION_NAME:$pane_info "source ~/.bashrc && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
             STATUS_FILE='$status_file' LOG_FILE='$log_file' RESULT_FILE='$result_file' && \
-            CUDA_VISIBLE_DEVICES=$gpu_id python experiments/libero/eval_libero_single.py \
+            CUDA_VISIBLE_DEVICES=$gpu_id $PYTHON_BIN experiments/libero/eval_libero_single.py \
             task=$CONFIG ckpt=$CKPT \
             EVALUATION.task_suite_name=$suite EVALUATION.task_id=$task_id gpu_id=$gpu_id \
             EVALUATION.num_trials=$NUM_TRIALS EVALUATION.output_dir=$OUTPUT_DIR $EXTRA_ARGS > \"\$LOG_FILE\" 2>&1; \

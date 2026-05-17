@@ -83,6 +83,30 @@ def _load_all_tasks() -> list[str]:
     return dedup_tasks
 
 
+def _wait_for_gpu_ids(num_gpus: int) -> list[int]:
+    if os.environ.get("WAIT_FOR_GPUS", "1") == "0":
+        return list(range(num_gpus))
+
+    script_path = PROJECT_ROOT / "scripts" / "wait_for_gpus.py"
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--count",
+        str(num_gpus),
+        "--visible",
+        visible,
+    ]
+    print("[wait_for_gpus] enabled for RoboTwin eval; set WAIT_FOR_GPUS=0 to skip.", flush=True)
+    selected = subprocess.check_output(cmd, cwd=str(PROJECT_ROOT), text=True).strip()
+    gpu_ids = [int(item) for item in selected.split(",") if item.strip()]
+    if len(gpu_ids) != num_gpus:
+        raise RuntimeError(f"Expected {num_gpus} selected GPUs, got {selected!r}")
+    os.environ["CUDA_VISIBLE_DEVICES"] = selected
+    print(f"[wait_for_gpus] selected GPU ids: {selected}", flush=True)
+    return gpu_ids
+
+
 def _parse_success_rate(result_file: Path) -> float:
     if not result_file.exists():
         raise FileNotFoundError(f"Result file not found: {result_file}")
@@ -152,7 +176,7 @@ def main(cfg: DictConfig):
     max_tasks_per_gpu = int(cfg.MULTIRUN.max_tasks_per_gpu)
     if max_tasks_per_gpu <= 0:
         raise ValueError("`MULTIRUN.max_tasks_per_gpu` must be > 0.")
-    gpu_ids = list(range(num_gpus))
+    gpu_ids = _wait_for_gpu_ids(num_gpus)
 
     output_dir = _resolve_path(str(cfg.EVALUATION.output_dir), base=PROJECT_ROOT)
     run_ts = output_dir.name

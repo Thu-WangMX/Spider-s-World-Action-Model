@@ -162,6 +162,8 @@ class FastWAM_DINO(nn.Module):
             feature_dim=dino_config.get("feature_dim", 1024),
             use_cls_token=dino_config.get("use_cls_token", False),
             normalize_features=dino_config.get("normalize_features", False),
+            latent_spatial_pool=tuple(dino_config.get("latent_spatial_pool", [1, 1])),
+            encode_microbatch_size=dino_config.get("encode_microbatch_size", 72),
         )
         dino_encoder.load_backbone(device=torch.device(device), dtype=torch_dtype)
 
@@ -217,7 +219,10 @@ class FastWAM_DINO(nn.Module):
                 dit_config=wan_dit_config,
                 skip_dit_load_from_pretrain=False,
                 load_text_encoder=False,
+                load_vae=False,
             )
+            if wan_components.dit is None:
+                raise RuntimeError("Wan DiT initialization requested but loader returned no DiT.")
             video_expert.init_from_wan_dit(wan_components.dit.state_dict())
             del wan_components  # free memory
 
@@ -288,6 +293,8 @@ class FastWAM_DINO(nn.Module):
                 dit_config=dummy_dit_config,
                 skip_dit_load_from_pretrain=True,
                 load_text_encoder=True,
+                load_dit=False,
+                load_vae=False,
             )
             loaded_text_encoder = components.text_encoder
             loaded_tokenizer = components.tokenizer
@@ -884,7 +891,16 @@ class FastWAM_DINO(nn.Module):
     def load_checkpoint(self, path, optimizer=None):
         """Load model checkpoint."""
         checkpoint = torch.load(path, map_location="cpu")
-        self.mot.load_state_dict(checkpoint["mot"], strict=False)
+        missing, unexpected = self.mot.load_state_dict(checkpoint["mot"], strict=False)
+        if missing or unexpected:
+            logger.warning(
+                "FastWAM_DINO checkpoint loaded with non-strict MoT keys: "
+                "missing=%d unexpected=%d missing_head=%s unexpected_head=%s",
+                len(missing),
+                len(unexpected),
+                missing[:10],
+                unexpected[:10],
+            )
         if self.proprio_encoder is not None and "proprio_encoder" in checkpoint:
             self.proprio_encoder.load_state_dict(checkpoint["proprio_encoder"])
         if optimizer is not None and "optimizer" in checkpoint:

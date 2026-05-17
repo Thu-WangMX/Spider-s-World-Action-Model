@@ -22,6 +22,78 @@ from fastwam.utils.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _get_patches_center_coordinates(
+    num_patches_h: int,
+    num_patches_w: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    coords_h = torch.arange(0.5, num_patches_h, dtype=dtype, device=device) / num_patches_h
+    coords_w = torch.arange(0.5, num_patches_w, dtype=dtype, device=device) / num_patches_w
+    coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1)
+    return coords.flatten(0, 1).mul_(2.0).sub_(1.0)
+
+
+def _build_rope_embeddings(
+    height: int,
+    width: int,
+    patch_size: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    rope_theta: float = 100.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build DINOv3 2D RoPE embeddings for patch tokens."""
+    num_patches_h = height // patch_size
+    num_patches_w = width // patch_size
+    with torch.autocast(device_type=device.type if device.type != "mps" else "cpu", enabled=False):
+        coords = _get_patches_center_coordinates(
+            num_patches_h,
+            num_patches_w,
+            dtype=torch.float32,
+            device=device,
+        )
+        inv_freq = 1.0 / rope_theta ** torch.arange(
+            0,
+            1,
+            4 / head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        angles = 2 * torch.pi * coords[:, :, None] * inv_freq[None, None, :]
+        angles = angles.flatten(1, 2).tile(2)
+        cos = torch.cos(angles).to(dtype=dtype)
+        sin = torch.sin(angles).to(dtype=dtype)
+    return cos, sin
+
+
+def _apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE to patch tokens while leaving CLS/register prefix tokens untouched."""
+    num_tokens = q.shape[-2]
+    num_patches = sin.shape[-2]
+    num_prefix_tokens = num_tokens - num_patches
+
+    q_prefix, q_patches = q.split((num_prefix_tokens, num_patches), dim=-2)
+    k_prefix, k_patches = k.split((num_prefix_tokens, num_patches), dim=-2)
+
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+    q_patches = (q_patches * cos) + (_rotate_half(q_patches) * sin)
+    k_patches = (k_patches * cos) + (_rotate_half(k_patches) * sin)
+    return torch.cat((q_prefix, q_patches), dim=-2), torch.cat((k_prefix, k_patches), dim=-2)
+
+
 # ---------------------------------------------------------------------------
 # Lightweight ViT backbone — structure mirrors the DINOv3 safetensors exactly
 # ---------------------------------------------------------------------------
@@ -68,11 +140,16 @@ class _Attention(nn.Module):
         self.v_proj = nn.Linear(dim, dim, bias=True)
         self.o_proj = nn.Linear(dim, dim, bias=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         query = self.q_proj(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         key = self.k_proj(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         value = self.v_proj(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query, key = _apply_rotary_pos_emb(query, key, *position_embeddings)
         attn_out = F.scaled_dot_product_attention(query, key, value)
         attn_out = attn_out.transpose(1, 2).reshape(batch_size, seq_len, -1)
         return self.o_proj(attn_out)
@@ -120,8 +197,12 @@ class _Block(nn.Module):
             self.layer_scale1 = None
             self.layer_scale2 = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attn_out = self.attention(self.norm1(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        attn_out = self.attention(self.norm1(x), position_embeddings)
         if self.layer_scale1 is not None:
             x = x + attn_out * self.layer_scale1["lambda1"]
         else:
@@ -179,6 +260,7 @@ class _DinoViT(nn.Module):
         self.embed_dim = embed_dim
         self.num_patches = (image_size // patch_size) ** 2
         self.num_register_tokens = num_register_tokens
+        self.rope_theta = 100.0
 
         self.embeddings = _Embeddings(in_channels, embed_dim, patch_size, num_register_tokens)
 
@@ -191,28 +273,36 @@ class _DinoViT(nn.Module):
 
     def forward_features(self, x: torch.Tensor) -> dict:
         batch_size = x.shape[0]
+        _, _, height, width = x.shape
 
         # Patch embedding
-        x = self.embeddings.patch_embeddings(x).flatten(2).transpose(1, 2)  # [B, N, D]
+        patch_tokens = self.embeddings.patch_embeddings(x).flatten(2).transpose(1, 2)  # [B, N, D]
 
-        # Prepend CLS token
+        # Match DINOv3 token order: CLS | register tokens | patch tokens.
         cls_tokens = self.embeddings.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)  # [B, 1+N, D]
-
-        # Append register tokens
         if self.num_register_tokens > 0:
             reg_tokens = self.embeddings.register_tokens.expand(batch_size, -1, -1)
-            x = torch.cat([x, reg_tokens], dim=1)  # [B, 1+N+R, D]
+            x = torch.cat([cls_tokens, reg_tokens, patch_tokens], dim=1)
+        else:
+            x = torch.cat([cls_tokens, patch_tokens], dim=1)
 
-        # No position embeddings in DINOv3 (checkpoint has none)
+        position_embeddings = _build_rope_embeddings(
+            height=height,
+            width=width,
+            patch_size=self.patch_size,
+            head_dim=self.embed_dim // self.layer[0].attention.num_heads,
+            dtype=x.dtype,
+            device=x.device,
+            rope_theta=self.rope_theta,
+        )
 
         for block in self.layer:
-            x = block(x)
+            x = block(x, position_embeddings)
         x = self.norm(x)
 
-        # Split: CLS | patch_tokens | register_tokens (discarded)
+        # Split: CLS | register_tokens | patch_tokens. Register tokens are not returned.
         cls_out = x[:, 0]
-        patch_tokens = x[:, 1:1 + self.num_patches]
+        patch_tokens = x[:, 1 + self.num_register_tokens:]
 
         return {
             "x_norm_clstoken": cls_out,
@@ -253,6 +343,80 @@ def _build_dino_vit(
     )
 
 
+def _remap_timm_dinov3_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    model: _DinoViT,
+) -> dict[str, torch.Tensor]:
+    """Convert timm DINOv3 ViT checkpoint keys to the lightweight HF-style keys."""
+    remapped: dict[str, torch.Tensor] = {}
+    model_state = model.state_dict()
+
+    for key, value in state_dict.items():
+        if key == "cls_token":
+            remapped["embeddings.cls_token"] = value
+        elif key == "reg_token":
+            remapped["embeddings.register_tokens"] = value
+        elif key == "patch_embed.proj.weight":
+            remapped["embeddings.patch_embeddings.weight"] = value
+        elif key == "patch_embed.proj.bias":
+            remapped["embeddings.patch_embeddings.bias"] = value
+        elif key == "norm.weight":
+            remapped["norm.weight"] = value
+        elif key == "norm.bias":
+            remapped["norm.bias"] = value
+        elif key.startswith("blocks."):
+            parts = key.split(".")
+            if len(parts) < 3:
+                continue
+            block_idx = parts[1]
+            suffix = ".".join(parts[2:])
+            prefix = f"layer.{block_idx}"
+
+            if suffix == "attn.qkv.weight":
+                q_weight, k_weight, v_weight = value.chunk(3, dim=0)
+                remapped[f"{prefix}.attention.q_proj.weight"] = q_weight
+                remapped[f"{prefix}.attention.k_proj.weight"] = k_weight
+                remapped[f"{prefix}.attention.v_proj.weight"] = v_weight
+            elif suffix == "attn.qkv.bias":
+                q_bias, k_bias, v_bias = value.chunk(3, dim=0)
+                remapped[f"{prefix}.attention.q_proj.bias"] = q_bias
+                remapped[f"{prefix}.attention.v_proj.bias"] = v_bias
+                if k_bias.abs().max().item() > 0:
+                    logger.warning(
+                        "Ignoring non-zero timm DINOv3 K bias for block %s; lightweight model uses bias=False.",
+                        block_idx,
+                    )
+            elif suffix == "attn.proj.weight":
+                remapped[f"{prefix}.attention.o_proj.weight"] = value
+            elif suffix == "attn.proj.bias":
+                remapped[f"{prefix}.attention.o_proj.bias"] = value
+            elif suffix == "mlp.fc1.weight":
+                remapped[f"{prefix}.mlp.up_proj.weight"] = value
+            elif suffix == "mlp.fc1.bias":
+                remapped[f"{prefix}.mlp.up_proj.bias"] = value
+            elif suffix == "mlp.fc2.weight":
+                remapped[f"{prefix}.mlp.down_proj.weight"] = value
+            elif suffix == "mlp.fc2.bias":
+                remapped[f"{prefix}.mlp.down_proj.bias"] = value
+            elif suffix == "gamma_1":
+                remapped[f"{prefix}.layer_scale1.lambda1"] = value
+            elif suffix == "gamma_2":
+                remapped[f"{prefix}.layer_scale2.lambda1"] = value
+            elif suffix.startswith("norm1.") or suffix.startswith("norm2."):
+                remapped[f"{prefix}.{suffix}"] = value
+
+    # timm DINOv3 checkpoints omit all-zero QKV bias tensors and mask_token.
+    # Keep the lightweight model numerically aligned by explicitly filling the
+    # omitted Q/V biases with zeros; K has bias=False.
+    for key, value in model_state.items():
+        if key.endswith("attention.q_proj.bias") or key.endswith("attention.v_proj.bias"):
+            remapped.setdefault(key, torch.zeros_like(value))
+        elif key == "embeddings.mask_token":
+            remapped.setdefault(key, torch.zeros_like(value))
+
+    return remapped
+
+
 # ---------------------------------------------------------------------------
 # Weight loading
 # ---------------------------------------------------------------------------
@@ -267,8 +431,8 @@ def _load_dino_from_safetensors(
 ) -> _DinoViT:
     """Load a _DinoViT from a DINOv3 safetensors checkpoint.
 
-    No key remapping is needed because the _DinoViT structure mirrors the
-    checkpoint layout exactly.
+    Native DINOv3 checkpoints mirror the lightweight model keys directly;
+    timm checkpoints are detected and remapped before loading.
     """
     from safetensors.torch import load_file
 
@@ -279,6 +443,9 @@ def _load_dino_from_safetensors(
     )
 
     state_dict = load_file(weights_path, device="cpu")
+    if any(key.startswith("blocks.") for key in state_dict):
+        logger.info("Detected timm DINOv3 checkpoint format; remapping keys.")
+        state_dict = _remap_timm_dinov3_state_dict(state_dict, model)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
     if unexpected:
@@ -317,6 +484,12 @@ class DinoVideoEncoder(nn.Module):
         feature_dim: Output feature dimension per patch (1024 for ViT-L).
         use_cls_token: Whether to prepend the CLS token to patch features.
         normalize_features: Whether to L2-normalize output features.
+        latent_spatial_pool: Optional average-pooling factor applied to encoded
+            DINO latents as (height_pool, width_pool). This can compress wide
+            multi-camera layouts after DINO encoding while preserving both views.
+        encode_microbatch_size: Maximum number of frames to encode per DINO
+            forward call. Keeps memory bounded while avoiding per-frame Python
+            loops. Set to <=0 to encode all frames at once.
     """
 
     def __init__(
@@ -328,6 +501,8 @@ class DinoVideoEncoder(nn.Module):
         feature_dim: int = 1024,
         use_cls_token: bool = False,
         normalize_features: bool = False,
+        latent_spatial_pool: Tuple[int, int] = (1, 1),
+        encode_microbatch_size: int = 72,
     ):
         super().__init__()
         self.model_name = model_name
@@ -337,6 +512,14 @@ class DinoVideoEncoder(nn.Module):
         self.feature_dim = feature_dim
         self.use_cls_token = use_cls_token
         self.normalize_features = normalize_features
+        if len(latent_spatial_pool) != 2:
+            raise ValueError(
+                f"`latent_spatial_pool` must be a 2-tuple/list, got {latent_spatial_pool}"
+            )
+        self.latent_spatial_pool = (int(latent_spatial_pool[0]), int(latent_spatial_pool[1]))
+        if self.latent_spatial_pool[0] <= 0 or self.latent_spatial_pool[1] <= 0:
+            raise ValueError(f"`latent_spatial_pool` values must be positive, got {self.latent_spatial_pool}")
+        self.encode_microbatch_size = int(encode_microbatch_size)
 
         self.grid_size = (
             input_resolution[0] // patch_size,
@@ -397,7 +580,9 @@ class DinoVideoEncoder(nn.Module):
             f"DinoVideoEncoder loaded: model={self.model_name}, "
             f"path={self.model_path}, "
             f"resolution={self.input_resolution}, grid={self.grid_size}, "
-            f"feature_dim={self.feature_dim}, num_patches={self.num_patches}"
+            f"feature_dim={self.feature_dim}, num_patches={self.num_patches}, "
+            f"latent_spatial_pool={self.latent_spatial_pool}, "
+            f"encode_microbatch_size={self.encode_microbatch_size}"
         )
 
     def _hub_model_name(self) -> str:
@@ -462,7 +647,9 @@ class DinoVideoEncoder(nn.Module):
         else:
             # Transformers API fallback
             output = self.backbone(frames_norm, output_hidden_states=False)
-            patch_tokens = output.last_hidden_state[:, 1:]
+            num_register_tokens = int(getattr(self.backbone.config, "num_register_tokens", 0))
+            patch_start = 1 + num_register_tokens
+            patch_tokens = output.last_hidden_state[:, patch_start:]
             if self.use_cls_token:
                 cls_token = output.last_hidden_state[:, :1]
                 patch_tokens = torch.cat([cls_token, patch_tokens], dim=1)
@@ -476,8 +663,9 @@ class DinoVideoEncoder(nn.Module):
     def encode_video_to_latent(self, video: torch.Tensor) -> torch.Tensor:
         """Encode a video tensor into DINO latent features in spatial format.
 
-        Processes each frame independently through the frozen DINO encoder and
-        reshapes the output into a 5D tensor compatible with the DinoVideoDiT.
+        Flattens the temporal dimension and processes frames in configurable
+        microbatches through the frozen DINO encoder, then reshapes the output
+        into a 5D tensor compatible with the DinoVideoDiT.
 
         Args:
             video: [B, 3, T, H, W] RGB video, values in [-1, 1].
@@ -488,22 +676,60 @@ class DinoVideoEncoder(nn.Module):
         """
         if video.ndim != 5:
             raise ValueError(f"`video` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
+        if self.use_cls_token:
+            raise ValueError(
+                "`encode_video_to_latent` expects patch-only DINO features. "
+                "Set `use_cls_token=false` for video latent training."
+            )
 
         batch_size, channels, num_frames, height, width = video.shape
-        height_grid, width_grid = self.grid_size
+        if channels != 3:
+            raise ValueError(f"`video` channel dimension must be 3, got {channels}")
+        if height % self.patch_size != 0 or width % self.patch_size != 0:
+            raise ValueError(
+                "`video` spatial size must be divisible by DINO patch_size="
+                f"{self.patch_size}, got {(height, width)}"
+            )
+        height_grid = height // self.patch_size
+        width_grid = width // self.patch_size
+        num_patches = height_grid * width_grid
 
-        # Process each frame: [B, 3, T, H, W] → loop over T
-        all_frame_features = []
-        for frame_idx in range(num_frames):
-            frame = video[:, :, frame_idx]  # [B, 3, H, W]
-            features = self.encode_frames(frame)  # [B, N_patches, D]
-            all_frame_features.append(features)
+        # [B, 3, T, H, W] -> [B*T, 3, H, W].  This is much faster than a
+        # Python loop over frames while still allowing bounded microbatches.
+        frames = video.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+        microbatch_size = self.encode_microbatch_size
+        if microbatch_size <= 0:
+            microbatch_size = frames.shape[0]
 
-        # Stack frames: list of [B, N_patches, D] → [B, T, N_patches, D]
-        stacked = torch.stack(all_frame_features, dim=1)
+        frame_features = []
+        for start in range(0, frames.shape[0], microbatch_size):
+            features = self.encode_frames(frames[start:start + microbatch_size])
+            frame_features.append(features)
+
+        # [B*T, N_patches, D] -> [B, T, N_patches, D]
+        stacked = torch.cat(frame_features, dim=0)
+        if stacked.shape[1] != num_patches:
+            raise ValueError(
+                "DINO patch count mismatch: "
+                f"expected {num_patches} patches for video size {(height, width)}, "
+                f"got {stacked.shape[1]}."
+            )
+        stacked = stacked.reshape(batch_size, num_frames, num_patches, -1)
 
         # Reshape to spatial: [B, T, H_g*W_g, D] → [B, D, T, H_g, W_g]
         stacked = stacked.reshape(batch_size, num_frames, height_grid, width_grid, -1)
         latents = stacked.permute(0, 4, 1, 2, 3).contiguous()  # [B, D, T, H_g, W_g]
+        pool_h, pool_w = self.latent_spatial_pool
+        if pool_h != 1 or pool_w != 1:
+            if height_grid % pool_h != 0 or width_grid % pool_w != 0:
+                raise ValueError(
+                    "`latent_spatial_pool` must divide the DINO grid exactly, "
+                    f"got grid={(height_grid, width_grid)} and pool={self.latent_spatial_pool}."
+                )
+            latents = F.avg_pool3d(
+                latents,
+                kernel_size=(1, pool_h, pool_w),
+                stride=(1, pool_h, pool_w),
+            )
 
         return latents

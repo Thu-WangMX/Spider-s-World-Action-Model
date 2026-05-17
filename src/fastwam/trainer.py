@@ -373,6 +373,63 @@ class Wan22Trainer:
             "action_horizon": action_horizon,
         }
 
+    def _compute_eval_action_metrics(self, sample, pred_action, gt_action):
+        if gt_action is None or pred_action is None:
+            return {}
+        if sample["proprio"] is None:
+            raise ValueError("Eval sample must contain `proprio` for action denormalization.")
+
+        proprio = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
+        processor = self.val_dataset.lerobot_dataset.processor
+
+        denorm_actions = {}
+        action_meta = processor.shape_meta["action"]
+        state_meta = processor.shape_meta["state"]
+        for action_name, raw_action in (("pred", pred_action), ("gt", gt_action)):
+            if not isinstance(raw_action, torch.Tensor):
+                raise TypeError(f"{action_name} action must be a torch.Tensor, got {type(raw_action)}")
+            if raw_action.ndim == 2:
+                action_btd = raw_action.unsqueeze(0)
+            elif raw_action.ndim == 3 and raw_action.shape[0] == 1:
+                action_btd = raw_action
+            else:
+                raise ValueError(
+                    f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
+                )
+            action_btd = action_btd.detach().to(device="cpu", dtype=torch.float32)
+
+            batch = {
+                "action": action_btd,
+                "state": proprio,
+            }
+            batch = processor.action_state_merger.backward(batch)
+            batch = processor.normalizer.backward(batch)
+            merged_batch = {
+                "action": {meta["key"]: batch["action"][meta["key"]].squeeze(0) for meta in action_meta},
+                "state": {meta["key"]: batch["state"][meta["key"]].squeeze(0) for meta in state_meta},
+            }
+            merged_batch = processor.action_state_merger.forward(merged_batch)
+            denorm_action = merged_batch["action"].unsqueeze(0)
+            if denorm_action.ndim != 3 or denorm_action.shape[0] != 1:
+                raise ValueError(
+                    f"Denormalized {action_name} action must have shape [1, T, D], got {tuple(denorm_action.shape)}"
+                )
+            denorm_actions[action_name] = denorm_action
+
+        pred_action_denorm = denorm_actions["pred"]
+        gt_action_denorm = denorm_actions["gt"]
+
+        if pred_action_denorm.shape != gt_action_denorm.shape:
+            raise ValueError(
+                "Predicted action/GT action shape mismatch after denormalization: "
+                f"pred={tuple(pred_action_denorm.shape)} vs gt={tuple(gt_action_denorm.shape)}"
+            )
+        action_diff = pred_action_denorm - gt_action_denorm
+        return {
+            "action_l1": action_diff.abs().mean().item(),
+            "action_l2": action_diff.pow(2).mean().item(),
+        }
+
     @torch.no_grad()
     def evaluate(self):
         if self.val_dataset is None:
@@ -398,6 +455,47 @@ class Wan22Trainer:
         proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
         input_image = video0[:, 0].unsqueeze(0)
         _, num_frames, _, _ = video0.shape
+
+        if not hasattr(model, "infer") and hasattr(model, "infer_action"):
+            infer_kwargs = {
+                "input_image": input_image,
+                "action_horizon": sample["action_horizon"],
+                "proprio": proprio,
+                "num_inference_steps": self.eval_num_inference_steps,
+                "seed": 42,
+                "tiled": False,
+            }
+            if sample["context"] is not None:
+                infer_kwargs["prompt"] = None
+                infer_kwargs["context"] = sample["context"][0]
+                infer_kwargs["context_mask"] = sample["context_mask"][0]
+            else:
+                infer_kwargs["prompt"] = prompt
+
+            pred = model.infer_action(**infer_kwargs)
+            action_metrics = self._compute_eval_action_metrics(sample, pred.get("action"), action)
+
+            local_metrics = torch.tensor(
+                [
+                    float(val_loss),
+                    float(action_metrics["action_l2"]) if "action_l2" in action_metrics else -1.0,
+                    float(action_metrics["action_l1"]) if "action_l1" in action_metrics else -1.0,
+                ],
+                device=self.accelerator.device,
+                dtype=torch.float32,
+            ).unsqueeze(0)
+            gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
+            mean_metrics = gathered_metrics.mean(dim=0)
+
+            if was_dit_training:
+                self._set_dit_only_train_mode()
+
+            result = {"val_loss": float(mean_metrics[0].item())}
+            if "action_l2" in action_metrics:
+                result["action_l2"] = float(mean_metrics[1].item())
+            if "action_l1" in action_metrics:
+                result["action_l1"] = float(mean_metrics[2].item())
+            return result
 
         # 2. inference and video saving
         infer_kwargs = {
@@ -438,60 +536,7 @@ class Wan22Trainer:
         psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
         ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
 
-        action_l1 = None
-        action_l2 = None
-        if action is not None and pred_action is not None:
-            if sample["proprio"] is None:
-                raise ValueError("Eval sample must contain `proprio` for action denormalization.")
-            proprio = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
-            
-            processor = self.val_dataset.lerobot_dataset.processor
-
-            denorm_actions = {}
-            action_meta = processor.shape_meta["action"]
-            state_meta = processor.shape_meta["state"]
-            for action_name, raw_action in (("pred", pred_action), ("gt", action)):
-                if not isinstance(raw_action, torch.Tensor):
-                    raise TypeError(f"{action_name} action must be a torch.Tensor, got {type(raw_action)}")
-                if raw_action.ndim == 2:
-                    action_btd = raw_action.unsqueeze(0)
-                elif raw_action.ndim == 3 and raw_action.shape[0] == 1:
-                    action_btd = raw_action
-                else:
-                    raise ValueError(
-                        f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
-                    )
-                action_btd = action_btd.detach().to(device="cpu", dtype=torch.float32)
-
-                batch = {
-                    "action": action_btd,
-                    "state": proprio,
-                }
-                batch = processor.action_state_merger.backward(batch)
-                batch = processor.normalizer.backward(batch)
-                merged_batch = {
-                    "action": {meta["key"]: batch["action"][meta["key"]].squeeze(0) for meta in action_meta},
-                    "state": {meta["key"]: batch["state"][meta["key"]].squeeze(0) for meta in state_meta},
-                }
-                merged_batch = processor.action_state_merger.forward(merged_batch)
-                denorm_action = merged_batch["action"].unsqueeze(0)
-                if denorm_action.ndim != 3 or denorm_action.shape[0] != 1:
-                    raise ValueError(
-                        f"Denormalized {action_name} action must have shape [1, T, D], got {tuple(denorm_action.shape)}"
-                    )
-                denorm_actions[action_name] = denorm_action
-
-            pred_action_denorm = denorm_actions["pred"]
-            gt_action_denorm = denorm_actions["gt"]
-
-            if pred_action_denorm.shape != gt_action_denorm.shape:
-                raise ValueError(
-                    "Predicted action/GT action shape mismatch after denormalization: "
-                    f"pred={tuple(pred_action_denorm.shape)} vs gt={tuple(gt_action_denorm.shape)}"
-                )
-            action_diff = pred_action_denorm - gt_action_denorm
-            action_l1 = action_diff.abs().mean().item()
-            action_l2 = action_diff.pow(2).mean().item()
+        action_metrics = self._compute_eval_action_metrics(sample, pred_action, action)
 
         # 4. VAE reconstruction metrics against GT video
         gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
@@ -534,16 +579,16 @@ class Wan22Trainer:
                 float(ssim_rollout_vs_decode),
                 float(psnr_decode_vs_gt),
                 float(ssim_decode_vs_gt),
-                float(action_l2) if action_l2 is not None else -1.0,
-                float(action_l1) if action_l1 is not None else -1.0,
+                float(action_metrics["action_l2"]) if "action_l2" in action_metrics else -1.0,
+                float(action_metrics["action_l1"]) if "action_l1" in action_metrics else -1.0,
             ],
             device=self.accelerator.device,
             dtype=torch.float32,
         ).unsqueeze(0)
         gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
         mean_metrics = gathered_metrics[:, :7].mean(dim=0)
-        action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
-        action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
+        action_l2_mean = gathered_metrics[:, 7].mean().item() if "action_l2" in action_metrics else None
+        action_l1_mean = gathered_metrics[:, 8].mean().item() if "action_l1" in action_metrics else None
 
         if was_dit_training:
             self._set_dit_only_train_mode()
@@ -733,12 +778,15 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+                            description = "[eval] step=%d val_loss=%.4f" % (
                                 self.global_step,
                                 metrics["val_loss"],
-                                metrics["psnr_rd"],
-                                metrics["ssim_rd"],
                             )
+                            if "psnr_rd" in metrics and "ssim_rd" in metrics:
+                                description += " infer_psnr=%.4f infer_ssim=%.4f" % (
+                                    metrics["psnr_rd"],
+                                    metrics["ssim_rd"],
+                                )
                             if "action_l2" in metrics:
                                 description += " action_l2=%.4f" % metrics["action_l2"]
                             if "action_l1" in metrics:
@@ -746,13 +794,10 @@ class Wan22Trainer:
                             logger.info(description)
                             eval_payload = {
                                 "eval/val_loss": float(metrics["val_loss"]),
-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
                             }
+                            for key in ("psnr_rg", "ssim_rg", "psnr_rd", "ssim_rd", "psnr_dg", "ssim_dg"):
+                                if key in metrics:
+                                    eval_payload[f"eval/{key}"] = float(metrics[key])
                             if "action_l2" in metrics:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:

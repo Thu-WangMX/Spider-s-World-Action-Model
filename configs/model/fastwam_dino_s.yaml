@@ -7,25 +7,23 @@ mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
 
-# Optional: initialize DinoVideoDiT Transformer layers from Wan2.2 Video DiT
-# This copies blocks.*, text_embedding.*, time_embedding.*, time_projection.*
-# Only input_projection and head remain randomly initialized
+# Optional: initialize DinoVideoDiT Transformer layers from Wan2.2 Video DiT.
+# Keep false for the first DINO-S ablation to reduce moving parts.
 video_dit_init_from_wan: false
 wan_model_id: "Wan-AI/Wan2.2-TI2V-5B"
 
-# DINO encoder config (frozen) — DINOv3-ViT-L/16
+# DINO encoder config (frozen) -- DINOv3-ViT-S/16 from public timm weights.
 dino_config:
-  model_name: "dinov3-vitl16"
-  model_path: "/data11/wmx/Spider-s-World-Action-Model/checkpoints/dinov3_weights/dinov3_vitl16_pretrain_lvd1689m.safetensors"
+  model_name: "dinov3-vits16-timm"
+  model_path: "/data11/wmx/Spider-s-World-Action-Model/checkpoints/dinov3_weights/dinov3_vits16_timm_lvd1689m.safetensors"
   input_resolution: [224, 224]
   patch_size: 16
-  feature_dim: 1024
+  feature_dim: 384
   use_cls_token: false
   normalize_features: false
-  encode_microbatch_size: 72
+  encode_microbatch_size: 144
 
-# DINO Video DiT config (trainable)
-# NOTE: num_heads, attn_head_dim, num_layers must match action_dit_config for MoT
+# Keep the DiT/MoT capacity identical to the DINO-L config for an encoder-only ablation.
 video_dit_config:
   hidden_dim: 3072
   ffn_dim: 14336
@@ -38,7 +36,6 @@ video_dit_config:
   video_attention_mask_mode: "first_frame_causal"
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
 
-# Action DiT config (trainable, same as original FastWAM)
 action_dit_config:
   action_dim: ${data.train.processor.action_output_dim}
   hidden_dim: 1024

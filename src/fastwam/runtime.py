@@ -257,6 +257,8 @@ def create_fastwam_dino(
     action_scheduler=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
+    video_dit_init_from_wan: bool = False,
+    wan_model_id: str = "Wan-AI/Wan2.2-TI2V-5B",
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):

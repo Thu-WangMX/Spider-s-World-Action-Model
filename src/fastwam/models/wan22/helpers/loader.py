@@ -20,12 +20,12 @@ SKIPPED_PRETRAIN_SENTINEL = "SKIPPED_PRETRAIN"
 
 @dataclass
 class Wan22LoadedComponents:
-    dit: WanVideoDiT
-    vae: WanVideoVAE38
+    dit: WanVideoDiT | None
+    vae: WanVideoVAE38 | None
     text_encoder: WanTextEncoder | None
     tokenizer: HuggingfaceTokenizer | None
-    dit_path: str
-    vae_path: str
+    dit_path: str | None
+    vae_path: str | None
     text_encoder_path: str | None
     tokenizer_path: str | None
 
@@ -148,13 +148,15 @@ def load_wan22_ti2v_5b_components(
     dit_config: dict[str, Any] | None = None,
     skip_dit_load_from_pretrain: bool = False,
     load_text_encoder: bool = True,
+    load_dit: bool = True,
+    load_vae: bool = True,
 ):
     logger.info("Loading Wan2.2-TI2V-5B components...")
     start = time.time()
 
-    if dit_config is None:
+    if load_dit and dit_config is None:
         raise ValueError("`dit_config` is required for Wan2.2-TI2V-5B loading.")
-    validated_dit_config = _validate_dit_config(dit_config)
+    validated_dit_config = _validate_dit_config(dit_config) if load_dit else None
 
     dit_model_config, text_config, vae_config, tokenizer_config = _resolve_configs(
         model_id=model_id,
@@ -162,12 +164,17 @@ def load_wan22_ti2v_5b_components(
         redirect_common_files=redirect_common_files,
     )
 
-    vae_config.download_if_necessary()
+    if load_vae:
+        vae_config.download_if_necessary()
     if load_text_encoder:
         text_config.download_if_necessary()
         tokenizer_config.download_if_necessary()
 
-    if skip_dit_load_from_pretrain:
+    dit: WanVideoDiT | None = None
+    dit_path: str | None = None
+    if not load_dit:
+        logger.info("Skipping video DiT construction (`load_dit=False`).")
+    elif skip_dit_load_from_pretrain:
         logger.info(
             "Skipping pretrained video DiT load (`skip_dit_load_from_pretrain=True`); "
             "initializing video expert randomly and expecting checkpoint override."
@@ -184,6 +191,7 @@ def load_wan22_ti2v_5b_components(
             model_kwargs_override=validated_dit_config,
         )
         dit_path = str(dit_model_config.path)
+
     text_encoder: WanTextEncoder | None = None
     tokenizer: HuggingfaceTokenizer | None = None
     text_encoder_path: str | None = None
@@ -207,7 +215,15 @@ def load_wan22_ti2v_5b_components(
             "Skipping pretrained text encoder/tokenizer load (`load_text_encoder=False`); "
             "training must provide cached `context/context_mask`."
         )
-    vae: WanVideoVAE38 = _load_registered_model(vae_config.path, "wan_video_vae", torch_dtype=torch_dtype, device=device)
+
+    vae: WanVideoVAE38 | None = None
+    vae_path: str | None = None
+    if load_vae:
+        vae = _load_registered_model(vae_config.path, "wan_video_vae", torch_dtype=torch_dtype, device=device)
+        vae_path = str(vae_config.path)
+    else:
+        logger.info("Skipping VAE load (`load_vae=False`).")
+
     logger.info("Finished loading Wan2.2-TI2V-5B components in %.2f seconds.", time.time() - start)
     return Wan22LoadedComponents(
         dit=dit,
@@ -215,7 +231,7 @@ def load_wan22_ti2v_5b_components(
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         dit_path=dit_path,
-        vae_path=str(vae_config.path),
+        vae_path=vae_path,
         text_encoder_path=text_encoder_path,
         tokenizer_path=tokenizer_path,
     )
