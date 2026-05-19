@@ -23,6 +23,7 @@ dino_config:
   use_cls_token: false
   normalize_features: false
   encode_microbatch_size: 72
+  load_backbone: true
 
 # DINO Video DiT config (trainable)
 # NOTE: num_heads, attn_head_dim, num_layers must match action_dit_config for MoT

@@ -593,7 +593,7 @@ bash scripts/train_zero1.sh 8 task=libero_dino_s_smallvideo_2cam_224_1e-4 \
   +data.train.pretrained_norm_stats=checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json \
   wandb.enabled=true \
   wandb.project=fast-wam \
-  wandb.name=libero_dino_s_smallvideo_2cam224_pool_bs4ga4 \
+  wandb.name=libero_ddino_s_smallvideo_2cam224_pool_bs4ga4 \
   2>&1 | tee -a logs/libero_dino_s_smallvideo_2cam224_pool_bs4ga4_$(date +%Y%m%d_%H%M%S).log
 ```
 
@@ -1048,3 +1048,161 @@ python experiments/libero/run_libero_manager.py \
 - 目前更可疑的是训练目标/超参而不是训推代码 bug：
   - DINO run 的 video loss 很低，但 action loss/action L1 明显高于原 FastWAM 成功 checkpoint；接近物体但抓取失败也符合 action 精度不够导致 closed-loop rollout 误差积累的现象。
   - 下一轮建议优先做 action-focused ablation：降低或关闭 `lambda_video`、增加 action loss 权重、尝试 `eval_num_inference_steps=20/50`、对比 pooled DINO-S smallvideo 与 bigvideo、必要时短跑 action-only 版本确认 action loss 是否能降到原 FastWAM 量级。
+
+## 二十二、2026-05-17 对比 LDA-1B 后的 DINO-FastWAM 风险判断
+
+- 参考路径：`/data11/wmx/LDA-1B`。LDA 的核心不是“把原 video diffusion 换成 DINO latent”，而是专门为 DINO token/action token 设计的 MMDiT：
+  - 当前 DINO tokens、action tokens 做 joint self-attention；
+  - text/VLM tokens 分别 cross-attend 到 image/action streams；
+  - timestep + task embedding 做 per-layer modulation；
+  - 输出 action velocity 和 future DINO velocity。
+- LDA 训练目标是四任务混训：`policy / forward_dynamics / inverse_dynamics / video_gen`。policy 样本中 future visual token 是 learnable placeholder，不是强迫 policy 每个样本都重建完整未来视频；forward/video-gen 样本才承担 DINO future 预测。
+- LDA 默认配置更轻：
+  - `obs_horizon=1`，`future_action_window_size=15`，action horizon 16；
+  - DINO-S 224 单视图 token，含 CLS/register tokens；
+  - MMDiT 配置常见为 8 层或 16 层，而不是继续使用 30 层 5B Wan-style video expert；
+  - `num_inference_timesteps=4`，训练中可用 `repeated_diffusion_steps` 增加 timestep 覆盖。
+- 我们当前 DINO-FastWAM 与 LDA 差异很大，可能导致“不 work/性价比差”的主因：
+  1. 训练时对 33-step temporal window 做 32-step action flow matching，并对按 `action_video_freq_ratio` 子采样后的 2cam 224x448 DINO tokens 做 future video flow matching；若 full-token 且 ratio=4，则 DINO-S video token 量是 `9 * 14 * 28 = 3528` tokens/样本，仍明显重于 LDA policy 路径。
+  2. action 只从首帧 video cache 取条件，而 video loss 占同等权重；优化很容易先把 DINO video loss 学低，但 action 精度仍不足。
+  3. 仍沿用 Wan/FastWAM 的 30 层 video expert/MoT 框架，DINO 并没有带来结构上的轻量化。
+  4. LDA 使用 CLS/register + patch tokens；我们目前默认只用 patch tokens，并把双相机横向拼接成一个 224x448 图像。这未必是 bug，但与 LDA 的 DINO token 使用方式不同。
+  5. LDA 有显式 task embedding 和不同任务下的不同可见信息；我们只有同一个 joint video/action objective，缺少 inverse dynamics/forward dynamics 这种辅助约束分工。
+- 直接建议：
+  - 不建议继续重仓当前 “DINO full-token + 5B/big video expert + `lambda_video=lambda_action=1`”。
+  - 下一轮 DINO 只做轻量验证：`smallvideo`、`latent_spatial_pool=[1,2]` 或更强 pooling、`lambda_video=0~0.1`、`lambda_action=5~10`。
+  - 若要更像 LDA，应该新建一个 action-focused DINO policy 头：只编码当前 obs，future visual 用 learnable placeholder 或直接去掉 video loss，action/image tokens 用轻量 MMDiT joint attention，而不是沿用完整 FastWAM video expert。
+  - 更稳的 AAAI 主线仍应保留原 FastWAM baseline；DINO 作为 ablation/扩展点，不宜替代主路线。
+
+## 二十三、2026-05-17 关于 “33 帧 DINO future video” 和 2cam 拼接的一处澄清
+
+- `configs/data/libero_2cam.yaml` 里的 `num_frames=33` 是原始 observation 时间窗长度；对应 action horizon 是 `num_frames - 1 = 32`。
+- 训练样本里 action 分支仍预测 32 个 action step；评测时默认 `action_horizon=32`，通常每次执行 `replan_steps=10` 个 action 后重新规划。
+- video/DINO 分支并不是直接吃满 33 张图。`RobotVideoDataset` 会先用 `video_sample_indices = range(0, num_frames, action_video_freq_ratio)` 对视频帧做子采样；LIBERO 2cam 配置若 `action_video_freq_ratio=4`，实际 DINO/video loss 的帧索引是 `[0,4,8,...,32]`，共 9 帧。因此更准确的说法是：33-step temporal window，32-step action flow matching，9-frame subsampled DINO future video flow matching。
+- 双相机输入在训练和推理中保持一致：训练时按 `image,wrist_image` 顺序把两个 224x224 相机图沿宽度横向拼接成 224x448；推理评测的 `_obs_to_model_input()` 也按同样顺序把 agentview 和 wrist 图 resize/crop 到 224x224 后 `axis=1` 拼成 224x448，并检查 shape 是否等于 `data.train.video_size=[224,448]`。
+- 2cam DINO 配置必须继续保持 `model.dino_config.input_resolution=[224,448]`，否则会把横向拼接后的双相机输入错误缩放成 224x224。
+
+## 二十四、2026-05-17 新增离线 DINO latent cache 训练路径
+
+- 新增 `scripts/precompute_dino_latents.py`：按训练 dataset index 读取同一套图像预处理、双相机拼接和视频子采样，然后用配置中的 DINO encoder 离线编码，保存每个样本的 `[D,T,H,W]` latent 到 `00000000.pt` 这种 index 文件。
+- `RobotVideoDataset` 新增：
+  - `dino_latent_cache_dir`：训练时读取离线 DINO latent；
+  - `dino_latent_cache_required`：设为 true 时 cache 缺失/shape 错误会直接报错，不再随机换样本；
+  - `load_text_context`：预计算 DINO 时可关掉文本 cache 读取，避免无关依赖。
+- `FastWAM_DINO.build_inputs()` 现在优先使用 `sample["dino_latents"]`，缺失时回退到原来的在线 DINO 编码；因此默认配置不受影响。
+- `model.dino_config.load_backbone=false` 可用于 cached 训练，完全不加载 DINO backbone，进一步省显存；推理或在线编码训练必须保持 true。
+- cached 训练建议命令模式：
+  - 预计算：`python scripts/precompute_dino_latents.py task=libero_dino_s_2cam_224_1e-4 dino_latent_cache_dir=./data/dino_latents_cache/libero_dino_s_2cam224_pool1x2 +data.train.pretrained_norm_stats=checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json`
+  - 训练：在原训练命令上追加 `data.train.dino_latent_cache_dir=./data/dino_latents_cache/libero_dino_s_2cam224_pool1x2 data.train.dino_latent_cache_required=true model.dino_config.load_backbone=false`。
+
+## 二十五、2026-05-17 当前 DINO-S pooled big-video run 的判断
+
+- 当前 run：`runs/libero_dino_s_2cam_224_1e-4/2026-05-17_03-08-16`，命令关键项为 `latent_spatial_pool=[1,2]`、`lambda_video=0.25`、`lambda_action=1.0`、`lr=5e-5`、`batch_size=4`、`gradient_accumulation_steps=4`。
+- `step_008000.pt` 已保存；8200 step 的验证指标约为 `val_loss=0.0495, action_l2=0.0331, action_l1=0.0811`。
+- action loss/action L1 与前一版失败 run 相比没有本质改善，video loss 已很低；继续把这个 big-video pooled run 训到很久，边际收益可能较低。
+- 建议策略：保留 `step_008000.pt` 做一次快速/官方评测拿证据；随后优先切到 `fastwam_dino_s_smallvideo` + 离线 DINO latent cache，并尝试更 action-focused 的 loss（例如 `lambda_video=0~0.1`, `lambda_action=5~10`）。
+
+## 二十六、2026-05-17 pooled big-video step8000 快速评测结论
+
+- 当前 DINO-S pooled big-video run（`step_008000.pt`, `latent_spatial_pool=[1,2]`, `lambda_video=0.25`, `lr=5e-5`）不是完全失败：LIBERO Spatial 约 64% 成功率。
+- 但仍显著低于原 FastWAM baseline（用户反馈低 30 多点），且 LIBERO-10 只从昨天的 0 成功提升到 1 个成功，说明泛化/长任务执行仍明显不够。
+- 下一步不建议继续大力训练 big-video pooled 版本；应切到 `fastwam_dino_s_smallvideo`，配合离线 DINO latent cache，并把目标进一步 action-focused：优先尝试 `lambda_video=0.05`、`lambda_action=5.0`、`lr=5e-5`，观察 action loss 和快速 LIBERO Object/Spatial/10 指标是否改善。
+
+## 二十七、2026-05-17 DINO latent 预计算加速修正
+
+- 发现第一版 `scripts/precompute_dino_latents.py` 太慢的直接原因：按训练 window 串行 `dataset._get(idx)`，CPU 图像读取、相机拼接、resize/normalize 完全单进程执行；用户反馈全量缓存约 20 小时，不可接受。
+- 已改为 DataLoader 多 worker 预取/预处理，新增顶层配置 `dino_precompute_num_workers`，默认 8；每个分布式 rank 只处理自己的 index 分片，并跳过已有 cache。
+- 当前仍是 window-level cache，仍会重复编码重叠 window 中的同一底层帧；如果多 worker 后仍太慢，下一步应实现 frame-level/episode-level DINO cache，再由训练 window 组装 latent，以消除 stride=1 带来的重复编码。
+
+## 二十八、2026-05-17 已实现 frame-level DINO cache
+
+- 已新增 `dino_latent_cache_mode=frame`：
+  - 预计算时按 LeRobot global frame index 读取单帧双相机图，拼成 224x448 后只编码一次；
+  - 保存到 `CACHE_DIR/frames/00000042.pt`，每个文件是单帧 `[D,H,W]` DINO latent；
+  - 训练时 `RobotVideoDataset` 根据当前 window 的 `[idx, idx+4, ..., idx+32]` 全局 frame indices 读取 frame cache，并 stack 成 `[D,T,H,W]`。
+- 这样避免了 stride=1 window-level cache 对同一底层帧重复编码约多次的问题，同时 cache 体积也从 window latent 量级降到 frame latent 量级。
+- 已做 data smoke test：frame-level loader 能返回 `[3,224,448]`、范围约 `[-1,1]` 的双相机拼接输入。
+- 后续建议使用新的 cache 目录，例如 `./data/dino_latents_cache/libero_dino_s_2cam224_pool1x2_frame`，避免和旧 window-level cache 混用；训练时必须同时设置 `data.train.dino_latent_cache_mode=frame`。
+
+## 二十九、2026-05-18 frame cache 失败原因与修复
+
+- `run_cache_then_train_retry.sh` 没有进入训练，原因不是训练 OOM，而是 frame-level DINO cache 写盘失败。
+- 具体失败：cache 目录 `data/dino_latents_cache/libero_dino_s_2cam224_pool1x2_frame` 膨胀到约 3.7T，随后报 `No space left on device`，脚本重试仍失败并退出；卡释放后被其他用户占用。
+- 根因是 `torch.save(latents[local_i])` 保存了 batch tensor 的 storage view，每个单帧 cache 文件可能把整批 latent 的底层 storage 一起写入，导致单文件约 19MB，而不是预期的约 150KB。
+- 已修复 `scripts/precompute_dino_latents.py`：保存 window/frame latent 前显式 `.clone().contiguous()`，避免 torch.save 写入整批 storage。
+- 旧的 frame cache 文件已经膨胀且不可继续使用；需要清理旧 cache 目录后用修复后的脚本重建。清理属于删除操作，需用户明确确认后执行。
+
+## 三十、2026-05-18 训前代码体检：frame cache 预处理一致性修正
+
+- 重新检查了 DINO cache 生成、dataset 读取、cached training 和 LIBERO eval/inference 路径。
+- 发现 frame-level cache 原先直接从底层 `hf_dataset` 读单帧并手写 resize/concat/normalize；shape 正确，但和正常训练 dataset 路径不是逐像素一致。实测同一帧 `mean_abs_diff≈0.01`，局部 `max_abs_diff≈0.5~0.65`。
+- 已将 `scripts/precompute_dino_latents.py` 的 frame cache 单帧预处理改为复用正常训练路径里的 `FastWAMProcessor` image transforms，再做相同的相机拼接、resize/crop/normalize，确保 cache 里的 DINO 输入与在线训练 DINO 输入完全同源，同时避免为每个缓存帧加载完整 33-step window。
+- 修正后 smoke test：sample 0 的 9 个视频采样帧经 frame-cache path 与正常训练 path 的 `max_abs_diff` 和 `mean_abs_diff` 全部为 0。
+- 修正 `logs/run_framecache_then_train_retry_fixed.sh` 的等卡环境变量名：`WAIT_GPU_MAX_USED_MB / WAIT_GPU_MAX_UTIL / WAIT_GPU_INTERVAL`，与 `scripts/wait_for_gpus.py` 实际读取的名字一致。
+- `py_compile` 已通过：`scripts/precompute_dino_latents.py`、`robot_video_dataset.py`、`fastwam_dino.py`、`eval_libero_single.py`。
+- 当前 cached training 关键对齐项：`data.train.dino_latent_cache_mode=frame`、`data.train.dino_latent_cache_required=true`、`model.dino_config.load_backbone=false`、`model.dino_config.input_resolution=[224,448]`、`model.dino_config.latent_spatial_pool=[1,2]`。
+- eval/inference 不应带 `model.dino_config.load_backbone=false`；LIBERO eval 通过 `configs/sim_libero.yaml` 设置 `model.load_text_encoder=true`，并按训练一致的 224x448 双相机横拼输入在线编码首帧 DINO。
+- 发现旧 cache 目录 `data/dino_latents_cache/libero_dino_s_2cam224_pool1x2_frame` 中已有约 28G 文件，属于预处理一致性修正前生成的旧 cache；不能继续复用，否则新旧预处理会混合。
+- `logs/run_framecache_then_train_retry_fixed.sh` 已改用新目录 `data/dino_latents_cache/libero_dino_s_2cam224_pool1x2_frame_exact`，避免删除旧文件且避免混用旧 cache。
+- 训练阶段第一次进入 `bs=4, ga=4` 时失败原因是 `scripts/train_zero1.sh` 直接调用 `accelerate launch`，但 tmux/shell PATH 中没有 `accelerate` 命令；不是 OOM。
+- 已修复 `scripts/train_zero1.sh`：改为 `${PYTHON:-python3} -m accelerate.commands.launch`，和脚本指定的 fastwam Python 环境绑定，不再依赖 conda activate/PATH。
+- 当前自动 retry 已进入 `bs=2, ga=8` 并成功 launch：run 目录 `runs/libero_dino_s_smallvideo_2cam_224_1e-4/2026-05-18_14-50-08`，wandb run id `l5n3fbxn`，name `libero_dino_s_smallvideo_framecache_FIXED_lv0.05_la5_bs2ga8`。
+- 观察到 cached smallvideo 训练显存约 29~31G/卡，`bs=2, ga=8` 速度约 `0.18 step/s, 1.44 samples/s`，明显偏保守。
+- 已将 `logs/run_framecache_then_train_retry_fixed.sh` 的训练 retry 顺序改为保持全局 batch=64 的大 micro-batch 优先：`bs=16,ga=1 -> bs=8,ga=2 -> bs=4,ga=4 -> bs=2,ga=8 -> bs=1,ga=16`。
+- 后续观察：`bs=16,ga=1` 会真实 OOM，不应再优先尝试；`bs=8,ga=2` 训练本身能跑，但在 step 200 内部 eval 时失败。
+- `bs=8,ga=2` 失败根因不是 OOM，而是 `Wan22Trainer._to_batched_eval_sample()` 漏传了 `dino_latents` 和 pad masks，导致 cached training 的 eval batch 回退在线 DINO；此时配置里 `model.dino_config.load_backbone=false`，于是报 `RuntimeError: Backbone not loaded.`
+- 已修复 `src/fastwam/trainer.py`：eval sample 现在会保留 `dino_latents`、`action_is_pad`、`image_is_pad`；smoke test 确认正常 training dataset 的样本含 `dino_latents (384,9,14,14)`，batched eval 后为 `(1,384,9,14,14)`。
+- 已将 `logs/run_framecache_then_train_retry_fixed.sh` 的训练 retry 顺序改成 `bs=8,ga=2 -> bs=4,ga=4 -> bs=2,ga=8 -> bs=1,ga=16`，跳过已知 OOM 的 `bs=16,ga=1`。
+- 当前如果已有旧进程在跑，它不会自动加载这次 trainer.py 修复；建议尽快重启脚本，以便从 `bs=8,ga=2` 重新开始并避免 step 200 eval 再炸。
+
+## 三十一、2026-05-18 DINO 训推一致性再审计
+
+- 参考 `/data11/wmx/FastWAM` 原始实现重新检查了 DINO 版的训练、内部 eval、LIBERO eval、frame cache、训练脚本启动路径。
+- 主链路结论：DINO 版训练时用完整 9 帧 DINO latent 做 video flow matching，action 分支通过 MoT attention mask 只能看 first-frame video tokens；推理时在线 DINO 编码当前首帧，video expert prefill 一次 KV cache，再让 action expert denoise。这个设计与原 FastWAM 的 VAE first-frame cache 推理方式一致。
+- 训练/推理 2cam 输入保持一致：训练与 frame cache 均为 `image,wrist_image` 先各自 224x224，再横拼 224x448；LIBERO eval 的 `_obs_to_model_input()` 也是同顺序、同尺寸横拼；`model.dino_config.input_resolution=[224,448]`、`latent_spatial_pool=[1,2]` 对应 cache shape `[384,9,14,14]`。
+- 已修复一个潜在 cache 错配：`RobotVideoDataset._get()` 现在用 BaseLerobotDataset 实际返回的 `sample["idx"]` 作为 `dataset_idx` 和 DINO cache index。这样即使底层读取 retry 或 padding retry 换样本，也不会拿请求 idx 去读另一个样本的 cache。
+- 已给 `FastWAM_DINO.infer_action()` 补齐原 FastWAM 同款检查：推理只允许 `video_attention_mask_mode="first_frame_causal"`，避免误用其它 video mask 时 action 推理语义不成立。
+- 验证项已过：
+  - `py_compile`：`robot_video_dataset.py`、`fastwam_dino.py`、`trainer.py`、`precompute_dino_latents.py`、`eval_libero_single.py`、`scripts/train.py`；
+  - Hydra compose 当前 smallvideo + frame cache 训练覆盖项通过；
+  - dataset/cache smoke：`video=(3,9,224,448)`、`action=(32,7)`、`proprio=(32,8)`、`dino_latents=(384,9,14,14)`；
+  - frame-cache 预处理一致性 smoke：sample 0 的 9 个采样帧 cache path vs normal training path `max_diffs` 全部为 0。
+- 当前正在跑的训练进程不会自动加载本段新补丁；但这次补丁主要是边缘 cache index 防护和推理配置早报错，当前 `skip_padding_as_possible=false` 下不影响已跑主流程。下次启动会自动生效。
+
+## 三十二、2026-05-18 cached training 内部 eval 再修复
+
+- `bs=8,ga=2` 和自动 retry 的 `bs=4,ga=4` 都在 step 200 内部 eval 报 `RuntimeError: Backbone not loaded. Call load_backbone() first.`。
+- 根因：前一次修复只让 eval 的 `training_loss()` 能吃到 cached `dino_latents`；但 trainer 内部 eval 随后仍调用 `model.infer_action()` 计算 `action_l1/action_l2`，而 `infer_action()` 必须在线 DINO 编码首帧。cached training 配置里 `model.dino_config.load_backbone=false`，所以这里必炸。
+- 已修复 `src/fastwam/trainer.py`：当模型有 `infer_action` 且 `dino_encoder._loaded=false` 时，内部 eval 只汇总/记录 cached `val_loss`，跳过需要在线 DINO backbone 的 action inference metrics。正式 LIBERO eval 不受影响，正式 eval 仍应加载 DINO backbone。
+- 已清理误启动的 `bs=2,ga=8` 孤儿训练进程，重新在 tmux session `dino_framecache_train_restart_155252` 启动 `bs=8,ga=2`：
+  - run dir：`runs/libero_dino_s_smallvideo_2cam_224_1e-4/2026-05-18_15-52-52`
+  - log：`logs/train_libero_dino_s_smallvideo_framecache_FIXED_RESTART_bs8ga2_20260518_155252.log`
+  - wandb name：`libero_dino_s_smallvideo_framecache_FIXED_RESTART_lv0.05_la5_bs8ga2`
+- 验证：新 run 已通过 step 200 内部 eval，日志显示 `step=200 val_loss=1.3222`，随后继续到 step 210；没有再出现 Backbone traceback。当前速度约 `0.25 step/s, 8.04 samples/s`，4-7 卡显存约 55-56G。
+
+## 三十三、2026-05-18 关于 DINO adapter 方向
+
+- mentor 提出的关键判断：原 FastWAM 的效果很大程度来自复用 WAN 预训练 video DiT 的基座能力；如果 DINO 版只是保留 WAN-like 参数规模但随机初始化 video backbone，就等于用 LIBERO 这点数据从零训练一个基座级 DiT，成功概率很低。
+- adapter 是后续值得优先尝试的方向：尽量冻结或半冻结 WAN 预训练 video blocks，只训练 DINO feature 到 WAN token/hidden space 的输入 adapter、输出 head/adapter，以及 MoT/action 相关少量参数。
+- 目标不是单纯把 DINO feature 塞进一个随机大 DiT，而是最大化“蹭” WAN 已有时空生成先验，同时让 DINO 表征通过轻量 adapter 进入这个先验空间。
+
+## 三十四、2026-05-18 DINO big/small/cache/推理代码审查补充
+
+- 当前 smallvideo frame-cache 训练仍在跑，未打断；日志已到 3200+ step，4-7 卡显存约 55-56G/卡，速度约 `0.25 step/s`。
+- Hydra compose 检查确认：
+  - `libero_dino_2cam_224_1e-4`：DINO-L，`feature_dim=1024`，big video DiT `hidden_dim=3072, ffn_dim=14336`，`pool=[1,2]`，默认 `video_dit_init_from_wan=false`；
+  - `libero_dino_s_2cam_224_1e-4`：DINO-S，`feature_dim=384`，big video DiT `hidden_dim=3072, ffn_dim=14336`，`pool=[1,2]`；
+  - `libero_dino_s_smallvideo_2cam_224_1e-4`：DINO-S，small video DiT `hidden_dim=1024, ffn_dim=4096`，`pool=[1,2]`。
+- `scripts/train.py` 和 `experiments/libero/eval_libero_single.py` 都会把本仓库 `src` 加到 `sys.path` 前面；即使用 fastwam conda，也优先跑当前仓库代码。
+- 训推一致性复查：
+  - cached/online training 都进入同一个 `FastWAM_DINO.build_inputs()`，区别只是 `dino_latents` 是否来自 cache；
+  - 训练 action 分支通过 MoT mask 只能看 first-frame video tokens；
+  - 推理时 `infer_action()` 在线编码当前观测首帧 DINO，video expert prefill 一次 KV cache，再 denoise action，语义与训练 action 可见信息一致；
+  - LIBERO eval 输入仍是 `image + wrist_image` 横拼成 224x448，和训练/frame cache 的双相机横拼一致。
+- cache 对齐复查：
+  - `RobotVideoDataset._get()` 使用实际返回的 `sample["idx"]` 作为 `dataset_idx` 和 cache key；
+  - frame cache 训练时按同一 episode 内 `[idx, idx+4, ..., idx+32]` 组装 9 帧 latent；
+  - cache shape 会在模型里校验 D、H、W 是否与当前 DINO variant、resolution、pool 参数一致，避免 pool/版本混用。
+- 本次新增一个 window-cache 防护：`scripts/precompute_dino_latents.py` 的 `_IndexedVideoDataset` 现在也使用样本里的真实 `dataset_idx` 写 cache，防止 window-level 预计算在 dataset retry 时把 latent 写到请求 idx。
+- 本次新增一个 WAN init 防误用：`model.video_dit_init_from_wan=true` 现在要求 video DiT 保持 Wan2.2-5B 形状（`3072/14336/24 heads/128 head dim/30 layers`）；smallvideo 若误开该选项会提前报错。smallvideo 当前默认 false 是正确的，后续要蹭 WAN 需要显式 adapter 路线，而不是直接开这个 flag。
+- 验证：`py_compile` 已通过 `fastwam_dino.py`、`precompute_dino_latents.py`、`scripts/train.py`、`eval_libero_single.py`；smallvideo + `video_dit_init_from_wan=true` 的错误路径 smoke test 能提前给出明确 ValueError。

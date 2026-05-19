@@ -165,7 +165,13 @@ class FastWAM_DINO(nn.Module):
             latent_spatial_pool=tuple(dino_config.get("latent_spatial_pool", [1, 1])),
             encode_microbatch_size=dino_config.get("encode_microbatch_size", 72),
         )
-        dino_encoder.load_backbone(device=torch.device(device), dtype=torch_dtype)
+        if bool(dino_config.get("load_backbone", True)):
+            dino_encoder.load_backbone(device=torch.device(device), dtype=torch_dtype)
+        else:
+            logger.info(
+                "DinoVideoEncoder backbone loading disabled by dino_config.load_backbone=false. "
+                "Training must provide precomputed `dino_latents`; inference will require enabling the backbone."
+            )
 
         # Build DINO Video Expert
         video_expert = DinoVideoDiT(
@@ -187,6 +193,27 @@ class FastWAM_DINO(nn.Module):
         # Optionally initialize DinoVideoDiT from Wan2.2 Video DiT weights
         if video_dit_init_from_wan:
             from .helpers.loader import load_wan22_ti2v_5b_components
+
+            wan5b_shape = {
+                "hidden_dim": 3072,
+                "ffn_dim": 14336,
+                "num_heads": 24,
+                "attn_head_dim": 128,
+                "num_layers": 30,
+            }
+            incompatible = {
+                key: (int(video_dit_config[key]), expected)
+                for key, expected in wan5b_shape.items()
+                if int(video_dit_config.get(key, -1)) != expected
+            }
+            if incompatible:
+                raise ValueError(
+                    "`video_dit_init_from_wan=true` currently requires the "
+                    "DinoVideoDiT backbone to keep the Wan2.2-5B Transformer shape. "
+                    f"Incompatible video_dit_config entries: {incompatible}. "
+                    "Use the big DINO video config, or keep this flag false for "
+                    "smallvideo until an explicit adapter path is implemented."
+                )
 
             wan_dit_config = {
                 "has_image_input": False,
@@ -399,6 +426,30 @@ class FastWAM_DINO(nn.Module):
         video = image.unsqueeze(2)
         return self._encode_video_dino(video)
 
+    def _validate_dino_latent_shape(self, latents: torch.Tensor) -> None:
+        if latents.ndim != 5:
+            raise ValueError(f"DINO latents must be 5D [B,D,T,H,W], got shape {tuple(latents.shape)}")
+        expected_dim = int(getattr(self.video_expert, "dino_dim", latents.shape[1]))
+        if latents.shape[1] != expected_dim:
+            raise ValueError(
+                f"DINO latent channel mismatch: cache D={latents.shape[1]}, model D={expected_dim}."
+            )
+        if self.dino_encoder is None:
+            return
+        input_h, input_w = self.dino_encoder.input_resolution
+        patch_size = int(self.dino_encoder.patch_size)
+        pool_h, pool_w = self.dino_encoder.latent_spatial_pool
+        expected_h = (input_h // patch_size) // pool_h
+        expected_w = (input_w // patch_size) // pool_w
+        if tuple(latents.shape[-2:]) != (expected_h, expected_w):
+            raise ValueError(
+                "DINO latent spatial shape mismatch: "
+                f"cache={(latents.shape[-2], latents.shape[-1])}, "
+                f"expected={(expected_h, expected_w)} from input_resolution="
+                f"{self.dino_encoder.input_resolution}, patch_size={patch_size}, "
+                f"latent_spatial_pool={self.dino_encoder.latent_spatial_pool}."
+            )
+
     @torch.no_grad()
     def _build_mot_attention_mask(
         self,
@@ -477,29 +528,51 @@ class FastWAM_DINO(nn.Module):
         Returns:
             Dict with processed tensors ready for training_loss.
         """
-        video = sample["video"]
         if "context" not in sample or "context_mask" not in sample:
             raise ValueError("FastWAM_DINO training requires `context` and `context_mask`.")
         context = sample["context"]
         context_mask = sample["context_mask"]
         proprio = sample.get("proprio", None)
 
-        if video.ndim != 5:
-            raise ValueError(f"`video` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
-        batch_size, _, num_frames, height, width = video.shape
-
         if "action" not in sample:
             raise ValueError("`action` is required for training.")
         action = sample["action"]
         if action.ndim != 3:
             raise ValueError(f"`action` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
+        batch_size = action.shape[0]
 
         action_is_pad = sample.get("action_is_pad", None)
         image_is_pad = sample.get("image_is_pad", None)
 
-        # Encode video with frozen DINO
-        input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        input_latents = self._encode_video_dino(input_video)  # [B, D, T, H_g, W_g]
+        # Prefer precomputed DINO latents when present. This keeps the training
+        # graph identical after the frozen encoder, but removes the expensive
+        # DINO forward pass from every optimizer microstep.
+        if "dino_latents" in sample and sample["dino_latents"] is not None:
+            input_latents = sample["dino_latents"]
+            if input_latents.ndim != 5:
+                raise ValueError(
+                    f"`dino_latents` must be 5D [B,D,T,H,W], got shape {tuple(input_latents.shape)}"
+                )
+            if input_latents.shape[0] != batch_size:
+                raise ValueError(
+                    f"Batch mismatch between `dino_latents` and `action`: "
+                    f"{input_latents.shape[0]} vs {batch_size}"
+                )
+            self._validate_dino_latent_shape(input_latents)
+            input_latents = input_latents.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        else:
+            if "video" not in sample:
+                raise ValueError("FastWAM_DINO training requires either `dino_latents` or `video`.")
+            video = sample["video"]
+            if video.ndim != 5:
+                raise ValueError(f"`video` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
+            if video.shape[0] != batch_size:
+                raise ValueError(
+                    f"Batch mismatch between `video` and `action`: {video.shape[0]} vs {batch_size}"
+                )
+            input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            input_latents = self._encode_video_dino(input_video)  # [B, D, T, H_g, W_g]
+            self._validate_dino_latent_shape(input_latents)
 
         # First frame for conditioning
         first_frame_latents = input_latents[:, :, 0:1]
@@ -752,6 +825,10 @@ class FastWAM_DINO(nn.Module):
             Dict with key 'action': [T_a, a_dim] predicted action chunk.
         """
         self.eval()
+        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+            raise ValueError(
+                "`infer_action` requires `video_attention_mask_mode='first_frame_causal'."
+            )
 
         if input_image is None:
             raise ValueError("`input_image` is required for inference.")

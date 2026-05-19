@@ -31,6 +31,15 @@ max_grad_norm: 1.0
 weight_decay: 0.0
 resume: null
 
+# Optional offline DINO latent precompute. These are consumed by
+# scripts/precompute_dino_latents.py; normal training ignores them unless
+# data.train.dino_latent_cache_dir is also set.
+dino_latent_cache_dir: null
+dino_latent_cache_mode: window
+dino_precompute_batch_size: 8
+dino_precompute_num_workers: 8
+dino_latent_cache_dtype: bf16
+
 # wandb
 wandb:
   enabled: false

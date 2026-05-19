@@ -42,6 +42,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        load_text_context: bool = True,
+        dino_latent_cache_dir: Optional[str] = None,
+        dino_latent_cache_mode: str = "window",
+        dino_latent_cache_required: bool = False,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -72,6 +76,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.load_text_context = load_text_context
+        self.dino_latent_cache_dir = dino_latent_cache_dir
+        self.dino_latent_cache_mode = str(dino_latent_cache_mode).strip().lower()
+        if self.dino_latent_cache_mode not in {"window", "frame"}:
+            raise ValueError(
+                f"`dino_latent_cache_mode` must be 'window' or 'frame', got {dino_latent_cache_mode}"
+            )
+        self.dino_latent_cache_required = dino_latent_cache_required
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -112,6 +124,93 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.lerobot_dataset)
 
+    def _get_dino_latent_cache_path(self, idx: int) -> Optional[str]:
+        if self.dino_latent_cache_dir is None or str(self.dino_latent_cache_dir).strip() == "":
+            return None
+        return os.path.join(str(self.dino_latent_cache_dir), f"{int(idx):08d}.pt")
+
+    def _get_dino_frame_cache_path(self, idx: int) -> Optional[str]:
+        if self.dino_latent_cache_dir is None or str(self.dino_latent_cache_dir).strip() == "":
+            return None
+        return os.path.join(str(self.dino_latent_cache_dir), "frames", f"{int(idx):08d}.pt")
+
+    def _get_video_global_indices(self, idx: int) -> list[int]:
+        episode_to = self.lerobot_dataset.episode_data_index["to"]
+        episode_idx = int(torch.searchsorted(episode_to, torch.tensor(int(idx)), right=True).item())
+        episode_start = int(self.lerobot_dataset.episode_data_index["from"][episode_idx].item())
+        episode_end = int(self.lerobot_dataset.episode_data_index["to"][episode_idx].item())
+        return [
+            max(episode_start, min(episode_end - 1, int(idx) + int(offset)))
+            for offset in self.video_sample_indices
+        ]
+
+    def _load_cached_dino_latents(self, idx: int) -> Optional[torch.Tensor]:
+        if self.dino_latent_cache_mode == "frame":
+            return self._load_cached_dino_frame_latents(idx)
+
+        cache_path = self._get_dino_latent_cache_path(idx)
+        if cache_path is None:
+            return None
+        if not os.path.exists(cache_path):
+            if self.dino_latent_cache_required:
+                raise FileNotFoundError(
+                    f"Missing DINO latent cache for dataset idx={idx}: {cache_path}. "
+                    "Run scripts/precompute_dino_latents.py first, or disable "
+                    "`dino_latent_cache_required`."
+                )
+            return None
+
+        payload = torch.load(cache_path, map_location="cpu")
+        if isinstance(payload, dict):
+            latents = payload.get("dino_latents", payload.get("latents"))
+        else:
+            latents = payload
+        if latents is None:
+            raise KeyError(f"DINO latent cache missing `dino_latents`: {cache_path}")
+        if not torch.is_tensor(latents):
+            raise TypeError(f"Cached DINO latents must be a tensor, got {type(latents)} in {cache_path}")
+        if latents.ndim != 4:
+            raise ValueError(
+                f"Cached DINO latents must be [D,T,H,W] for one sample, "
+                f"got shape {tuple(latents.shape)} in {cache_path}"
+            )
+        return latents.contiguous()
+
+    def _load_cached_dino_frame_latents(self, idx: int) -> Optional[torch.Tensor]:
+        frame_indices = self._get_video_global_indices(idx)
+        latents = []
+        missing_paths = []
+        for frame_idx in frame_indices:
+            cache_path = self._get_dino_frame_cache_path(frame_idx)
+            if cache_path is None:
+                return None
+            if not os.path.exists(cache_path):
+                missing_paths.append(cache_path)
+                continue
+            payload = torch.load(cache_path, map_location="cpu")
+            latent = payload.get("dino_latent", payload.get("latent")) if isinstance(payload, dict) else payload
+            if latent is None:
+                raise KeyError(f"DINO frame cache missing `dino_latent`: {cache_path}")
+            if not torch.is_tensor(latent):
+                raise TypeError(f"Cached DINO frame latent must be a tensor, got {type(latent)} in {cache_path}")
+            if latent.ndim != 3:
+                raise ValueError(
+                    f"Cached DINO frame latent must be [D,H,W], got shape {tuple(latent.shape)} in {cache_path}"
+                )
+            latents.append(latent.contiguous())
+
+        if missing_paths:
+            if self.dino_latent_cache_required:
+                preview = ", ".join(missing_paths[:3])
+                raise FileNotFoundError(
+                    f"Missing {len(missing_paths)} DINO frame cache files for dataset idx={idx}: {preview}. "
+                    "Run scripts/precompute_dino_latents.py with dino_latent_cache_mode=frame first."
+                )
+            return None
+        if not latents:
+            return None
+        return torch.stack(latents, dim=1).contiguous()  # [D, T, H, W]
+
     def _get(self, idx):
         sample_idx = idx
         sample = None
@@ -136,6 +235,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 break
 
             sample_idx = np.random.randint(len(self.lerobot_dataset))
+
+        resolved_sample_idx = int(sample.get("idx", sample_idx))
         
         image_is_pad = sample["image_is_pad"]
 
@@ -215,22 +316,34 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             task = self.override_instruction
         instruction = DEFAULT_PROMPT.format(task=task)
 
-        context, context_mask = self._get_cached_text_context(instruction)
-        # NOTE: to keep consistent with wan2.2's behavior
-        context[~context_mask] = 0.0
-        context_mask = torch.ones_like(context_mask)
+        if self.load_text_context:
+            context, context_mask = self._get_cached_text_context(instruction)
+            # NOTE: to keep consistent with wan2.2's behavior
+            context[~context_mask] = 0.0
+            context_mask = torch.ones_like(context_mask)
         
         data = {
+            "dataset_idx": resolved_sample_idx,
             "video": video,
             "action": action,
             "proprio": proprio,
             "prompt": instruction,
-            "context": context,
-            "context_mask": context_mask,
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if self.load_text_context:
+            data["context"] = context
+            data["context_mask"] = context_mask
+
+        dino_latents = self._load_cached_dino_latents(resolved_sample_idx)
+        if dino_latents is not None:
+            if dino_latents.shape[1] != video.shape[1]:
+                raise ValueError(
+                    f"Cached DINO latent temporal length mismatch for idx={resolved_sample_idx}: "
+                    f"cache T={dino_latents.shape[1]}, video T={video.shape[1]}"
+                )
+            data["dino_latents"] = dino_latents
         return data
 
     def _get_cached_text_context(self, prompt: str):
@@ -271,6 +384,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         try:
             data = self._get(idx)
         except Exception as e:
+            if self.dino_latent_cache_required:
+                raise
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
             # trace back
             print(traceback.format_exc())

@@ -302,6 +302,9 @@ class Wan22Trainer:
         proprio = sample.get("proprio", None)
         context = sample.get("context", None)
         context_mask = sample.get("context_mask", None)
+        dino_latents = sample.get("dino_latents", None)
+        action_is_pad = sample.get("action_is_pad", None)
+        image_is_pad = sample.get("image_is_pad", None)
 
         if not isinstance(video, torch.Tensor):
             raise TypeError(
@@ -363,6 +366,38 @@ class Wan22Trainer:
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
                 )
 
+        if dino_latents is not None:
+            if not isinstance(dino_latents, torch.Tensor):
+                raise TypeError(f"`sample['dino_latents']` must be a torch.Tensor, got {type(dino_latents)}")
+            if dino_latents.ndim == 4:
+                dino_latents = dino_latents.unsqueeze(0)
+            if dino_latents.ndim != 5:
+                raise ValueError(
+                    f"`sample['dino_latents']` must be [D,T,H,W] or [B,D,T,H,W], "
+                    f"got {tuple(dino_latents.shape)}"
+                )
+            if dino_latents.shape[0] != video.shape[0] or dino_latents.shape[2] != video.shape[2]:
+                raise ValueError(
+                    "Eval DINO latent/video batch or temporal mismatch: "
+                    f"dino={tuple(dino_latents.shape)} video={tuple(video.shape)}"
+                )
+
+        if action_is_pad is not None:
+            if not isinstance(action_is_pad, torch.Tensor):
+                action_is_pad = torch.as_tensor(action_is_pad, dtype=torch.bool)
+            if action_is_pad.ndim == 1:
+                action_is_pad = action_is_pad.unsqueeze(0)
+            if action_is_pad.ndim != 2:
+                raise ValueError(f"`sample['action_is_pad']` must be [T] or [B,T], got {tuple(action_is_pad.shape)}")
+
+        if image_is_pad is not None:
+            if not isinstance(image_is_pad, torch.Tensor):
+                image_is_pad = torch.as_tensor(image_is_pad, dtype=torch.bool)
+            if image_is_pad.ndim == 1:
+                image_is_pad = image_is_pad.unsqueeze(0)
+            if image_is_pad.ndim != 2:
+                raise ValueError(f"`sample['image_is_pad']` must be [T] or [B,T], got {tuple(image_is_pad.shape)}")
+
         return {
             "video": video,
             "prompt": prompt,
@@ -370,6 +405,9 @@ class Wan22Trainer:
             "proprio": proprio,
             "context": context,
             "context_mask": context_mask,
+            "dino_latents": dino_latents,
+            "action_is_pad": action_is_pad,
+            "image_is_pad": image_is_pad,
             "action_horizon": action_horizon,
         }
 
@@ -448,6 +486,24 @@ class Wan22Trainer:
         with self.accelerator.autocast():
             val_loss, _ = model.training_loss(sample)
             val_loss = val_loss.float().item()
+
+        dino_encoder = getattr(model, "dino_encoder", None)
+        dino_backbone_loaded = True
+        if dino_encoder is not None:
+            dino_backbone_loaded = bool(getattr(dino_encoder, "_loaded", False))
+        if hasattr(model, "infer_action") and not dino_backbone_loaded:
+            local_metrics = torch.tensor(
+                [float(val_loss)],
+                device=self.accelerator.device,
+                dtype=torch.float32,
+            ).unsqueeze(0)
+            gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
+            mean_metrics = gathered_metrics.mean(dim=0)
+
+            if was_dit_training:
+                self._set_dit_only_train_mode()
+
+            return {"val_loss": float(mean_metrics[0].item())}
         
         prompt = sample["prompt"][0]
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)

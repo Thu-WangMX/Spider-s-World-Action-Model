@@ -23,6 +23,7 @@ dino_config:
   use_cls_token: false
   normalize_features: false
   encode_microbatch_size: 144
+  load_backbone: true
 
 video_dit_config:
   hidden_dim: 1024

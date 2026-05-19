@@ -22,6 +22,7 @@ dino_config:
   use_cls_token: false
   normalize_features: false
   encode_microbatch_size: 144
+  load_backbone: true
 
 # Keep the DiT/MoT capacity identical to the DINO-L config for an encoder-only ablation.
 video_dit_config:

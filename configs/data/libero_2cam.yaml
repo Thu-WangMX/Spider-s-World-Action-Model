@@ -34,6 +34,10 @@ train:
   is_training_set: true
   skip_padding_as_possible: false
   concat_multi_camera: "horizontal"
+  load_text_context: true
+  dino_latent_cache_dir: null
+  dino_latent_cache_mode: window
+  dino_latent_cache_required: false
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
     shape_meta: ${data.train.shape_meta}
