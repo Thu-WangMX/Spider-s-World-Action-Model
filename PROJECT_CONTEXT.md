@@ -1206,3 +1206,177 @@ python experiments/libero/run_libero_manager.py \
 - 本次新增一个 window-cache 防护：`scripts/precompute_dino_latents.py` 的 `_IndexedVideoDataset` 现在也使用样本里的真实 `dataset_idx` 写 cache，防止 window-level 预计算在 dataset retry 时把 latent 写到请求 idx。
 - 本次新增一个 WAN init 防误用：`model.video_dit_init_from_wan=true` 现在要求 video DiT 保持 Wan2.2-5B 形状（`3072/14336/24 heads/128 head dim/30 layers`）；smallvideo 若误开该选项会提前报错。smallvideo 当前默认 false 是正确的，后续要蹭 WAN 需要显式 adapter 路线，而不是直接开这个 flag。
 - 验证：`py_compile` 已通过 `fastwam_dino.py`、`precompute_dino_latents.py`、`scripts/train.py`、`eval_libero_single.py`；smallvideo + `video_dit_init_from_wan=true` 的错误路径 smoke test 能提前给出明确 ValueError。
+
+## 三十五、2026-05-19 训练 resume 机制检查
+
+- 训练 checkpoint 有两套：
+  - `checkpoints/weights/step_xxxxxx.pt`：只保存模型权重和 step 字段，用于 eval 或 weight-only finetune；
+  - `checkpoints/state/step_xxxxxx/`：Accelerate/DeepSpeed 完整训练状态，包含 ZeRO optimizer shard、scheduler、random states、`trainer_state.json`。
+- 对当前 smallvideo run，完整 state 已存在，例如：
+  - `runs/libero_dino_s_smallvideo_2cam_224_1e-4/2026-05-18_15-52-52/checkpoints/state/step_026000`
+  - 其中 `trainer_state.json` 为 `global_step=26000, epoch=5, batch_in_epoch=8600`。
+- 重要：如果要真正继续训练，应传 `resume=.../checkpoints/state/step_xxxxxx` 目录；传 `resume=.../weights/step_xxxxxx.pt` 只会加载权重，不会恢复 optimizer/scheduler/global_step，代码会明确 warning：`Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.`
+- 已修复 dataloader resume 的一个小问题：
+  - `load_training_state()` 现在会把 sampler epoch 设置成保存的 `epoch`；
+  - 训练每次进入新 epoch 时也会更新 sampler epoch；
+  - `ResumableEpochSampler` 的 batch offset skip 不再只限制在 `epoch==0`，因此从 `batch_in_epoch` 恢复时能正确跳过已消费 batch。
+- `py_compile` 已通过：`trainer.py`、`samplers.py`。
+- 完整 state resume 建议保持同样的 GPU 数/DeepSpeed 配置/模型配置/`batch_size`/`gradient_accumulation_steps`，尤其 ZeRO optimizer shards 通常依赖相同 world size；如果要改 GPU 数或 batch 设置，应使用 `.pt` 权重做 weight-only 启动，但这不等价于精确 resume。
+
+## 三十六、2026-05-20 LIBERO eval 并发与 CPU 线程限制
+
+- mentor 建议有道理：LIBERO/MuJoCo eval 是多进程仿真 + GPU policy inference 混合负载；默认 OpenMP/MKL/OpenBLAS 线程过多时，多个 eval worker 会抢 CPU，反而拖慢仿真。
+- 已新增 eval worker 线程限制配置：
+  - `MULTIRUN.omp_num_threads: 2`
+  - `MULTIRUN.mkl_num_threads: 1`
+  - `MULTIRUN.openblas_num_threads: 1`
+  - `MULTIRUN.numexpr_num_threads: 1`
+- `experiments/libero/run_libero_manager.py` 会把这些值写入 worker 环境变量；`experiments/libero/run_libero_parallel_test.sh` 在 tmux worker 里也会重新 export，防止 `source ~/.bashrc` 后丢失。
+- `bash -n run_libero_parallel_test.sh`、`py_compile run_libero_manager.py` 已通过；Hydra compose 测试 `MULTIRUN.max_tasks_per_gpu=4` 正常。
+- 当前 step 38k checkpoint 路径：
+  - `runs/libero_dino_s_smallvideo_2cam_224_1e-4/2026-05-19_21-30-18/checkpoints/weights/step_038000.pt`
+- 对 80G A800/A100，DINO-S smallvideo eval 可以尝试 `MULTIRUN.max_tasks_per_gpu=4`，即 4 卡同时最多 16 个 task worker；若出现 GPU OOM、CPU load 过高或 MuJoCo 不稳定，再降到 3 或 2。
+
+## 三十七、2026-05-20 step 043400 eval 报错原因
+
+- tmux session `dino` 中 30 trials eval 全部 worker 快速失败，不是 OOM，也不是 LIBERO 环境错误。
+- 根因是 checkpoint 路径写错：命令使用了旧 run dir：
+  - 错误：`runs/libero_dino_s_smallvideo_2cam_224_1e-4/2026-05-19_21-30-18/checkpoints/weights/step_043400.pt`
+  - 该目录实际只到 `step_038000.pt`。
+- resume 后新建了 run dir，最终权重实际在：
+  - `runs/libero_dino_s_smallvideo_2cam_224_1e-4/2026-05-20_11-53-25/checkpoints/weights/step_043400.pt`
+- 以后 eval 最终权重时优先 `find runs/libero_dino_s_smallvideo_2cam_224_1e-4 -path '*/checkpoints/weights/*.pt' | sort` 确认路径，避免旧 run dir/新 run dir 混用。
+
+## 三十八、2026-05-20 smallvideo step 043400 30-trial eval 结果
+
+- 使用正确最终权重：
+  - `runs/libero_dino_s_smallvideo_2cam_224_1e-4/2026-05-20_11-53-25/checkpoints/weights/step_043400.pt`
+- 评测目录：
+  - `evaluate_results/libero_dino_s_smallvideo_framecache_step_043400_official_4gpu_30trials_fast_retry`
+- 30 trials/task 结果：
+  - `libero_spatial=95.67`
+  - `libero_object=99.00`
+  - `libero_goal=94.67`
+  - `libero_10=82.00`
+  - `Overall=92.83`
+- 对比 step 038000 的 10 trials/task：
+  - `libero_spatial=98.00`
+  - `libero_object=100.00`
+  - `libero_goal=93.00`
+  - `libero_10=81.00`
+  - `Overall=93.00`
+- 结论：step 038000 到 step 043400 没有明显涨点；libero_goal/libero_10 小幅上升，spatial/object 小幅下降，overall 基本持平。考虑 trial 数不同，差异大概率在评测波动范围内。
+- task-level 观察：
+  - spatial/object 基本接近饱和，主要掉点来自少数 harder placement/grasp task：`libero_spatial_5=80%`、`libero_spatial_4=90%`、`libero_object_9=93.33%`；
+  - goal 的弱项是抽屉/架子相关：`libero_goal_0=76.67%`、`libero_goal_9=80%`；
+  - 真正限制 overall 的是 LIBERO-10：`libero_10_9=40%`、`libero_10_8=53.33%`、`libero_10_0=66.67%`、`libero_10_6=76.67%`；
+  - 从 38k 到 43.4k，LIBERO-10 的两个原本最弱项有提升：`task8 30%->53.33%`、`task9 30%->40%`，但 `task0 90%->66.67%`、`task6 90%->76.67%` 回落，抵消了收益。
+
+## 三十九、2026-05-20 smallvideo 40k/42k/43.4k 30-trial 对比
+
+- 30 trials/task full eval：
+  - `step_040000`: spatial `96.00`, object `98.33`, goal `93.33`, libero_10 `85.33`, overall `93.25`
+  - `step_042000`: spatial `96.67`, object `99.33`, goal `95.33`, libero_10 `83.00`, overall `93.58`
+  - `step_043400`: spatial `95.67`, object `99.00`, goal `94.67`, libero_10 `82.00`, overall `92.83`
+- 当前 30-trial 最优：
+  - 按 overall：`step_042000` 最好，`93.58%`
+  - 按 LIBERO-10：`step_040000` 最好，`85.33%`
+- 关键 task 变化：
+  - `libero_10_0`: `80.00 -> 70.00 -> 66.67`，持续下降；
+  - `libero_10_6`: `96.67 -> 80.00 -> 76.67`，持续下降；
+  - `libero_10_9`: `53.33 -> 50.00 -> 40.00`，持续下降；
+  - `libero_10_2`: `83.33 -> 93.33 -> 96.67`，持续上升；
+  - `libero_goal_0`: `56.67 -> 83.33 -> 76.67`，42k 最好；
+  - `libero_goal_9`: `90.00 -> 80.00 -> 80.00`，40k 最好。
+- 结论：训练后期不是单调提升，而是在任务之间换分。若论文/汇报使用单模型 overall，优先报告 `step_042000`；若优先 LIBERO-10，`step_040000` 更强。
+
+## 四十、2026-05-20 DINO PCA 可视化脚本
+
+- 新增 `scripts/visualize_dino_pca.py`，用于对比模型 rollout 出来的 predicted DINO latent 和真实 DINO latent。
+- 脚本行为：
+  - 加载指定 `ckpt`；
+  - 从训练集读取样本和 cached `dino_latents`；
+  - 用真实首帧 DINO latent 作为条件，从 noise 经过 video scheduler denoise 出 predicted DINO clip；
+  - 将 GT/pred DINO tokens 放在同一个 PCA basis 下投成 RGB；
+  - 输出每个样本的 `RGB frame / GT DINO PCA / Pred DINO PCA / RMSE heat` 拼图；
+  - 另存 LDA-style PCA 图：GT 和 Pred 各自按单帧独立 PCA、独立 min-max、双线性放大，更接近 `/data11/wmx/LDA-1B/eval/video_gen.py` 的 `visualize_dino()` 展示方式，肉眼更容易看空间结构，但颜色不再可严格跨图对齐；
+  - 同时保存 `.npz`，包含 `gt`、`pred`、`mse_per_frame`，便于后续量化分析。
+- 默认不加载 DINO backbone，依赖 frame/window cache，因此运行命令需要传：
+  - `data.train.dino_latent_cache_dir=...`
+  - `data.train.dino_latent_cache_mode=frame`
+  - `data.train.dino_latent_cache_required=true`
+  - `model.dino_config.load_backbone=false`
+- 已通过 `python3 -m py_compile scripts/visualize_dino_pca.py`。
+- 已用 fastwam conda smoke test `_fit_lda_style_pca_rgb()` 和共享 PCA 输出 shape/dtype 正常。
+
+## 四十一、2026-05-20 step 042000 DINO PCA 可视化观察
+
+- 可视化目录：`outputs/dino_pca/step042000_lda_style`
+- LDA-style PCA 图的主要结论：
+  - predicted DINO 不是完全坍缩，能保留桌面、柜体、盘子/碗等大块空间结构；
+  - 但预测明显更平滑、更粗，末端执行器、小物体边界、抓取/接触附近细节不清楚；
+  - 对动态大的样本，predicted future 的运动幅度偏小，表现为“知道大概区域，但跟不上真实交互变化”；
+  - 对近静态样本，pred 反而可能有额外漂移/幻觉变化。
+- 数值侧：
+  - future frame cosine 大多在 `0.89~0.96`，说明 latent 大方向相似；
+  - RMSE 随未来帧增大，动态样本末帧约 `0.15~0.16`；
+  - predicted temporal delta 通常小于 GT temporal delta，例如 sample0 `0.076 vs 0.105`、sample10000 `0.080 vs 0.128`；
+  - predicted spatial sharpness 是 GT 的约 `0.84~0.90`，定量支持“更平滑/更糊”的观察。
+- 解释：这和 LIBERO-10 的瓶颈吻合。模型学到了语义/大布局，但对多阶段任务中小物体、末端姿态、接触和精细放置的 latent dynamics 不够准。单纯 DINO future MSE 低不代表足够支撑精细控制。
+- 注意：当前 `latent_spatial_pool=[1,2]` 后只有 `14x14` token grid，天然比 LDA 例子里的 `40x30` 展示更粗；PCA 图只能看结构和坍缩趋势，不应期待像 RGB 一样直观。
+
+## 四十二、2026-05-21 lambda_video=1.0 续训状态
+
+- 当前续训 run：`runs/libero_dino_s_smallvideo_2cam_224_1e-4/2026-05-20_20-28-53`
+- 续训设置：从 `step_040000` resume，`lambda_video=1.0`、`lambda_action=5.0`、`lr=1e-5`、`num_epochs=15`、frame cache、`batch_size=8`、`gradient_accumulation_steps=2`。
+- 2026-05-21 11:15 左右状态：
+  - 训练仍在运行，约 `epoch=12 step=53400/65100`；
+  - 最新已保存权重：`checkpoints/weights/step_052000.pt`；
+  - 近期训练速度约 `0.25 step/s, 8.08 samples/s`；
+  - 近期 loss 大致：`loss_action=0.07~0.20`、`loss_video=0.02~0.03`；
+  - `step=53400 val_loss=0.0948`。
+- 建议：可以先评测 `step_052000.pt` 判断 `lambda_video=1.0` 是否带来收益；不要抢 4-7 上正在跑的训练，优先用 wait-for-gpus 在 0-3 或训练结束后的 4-7 排队评测。
+
+## 四十三、2026-05-21 step 052000 lambda_video=1.0 评测结果
+
+- 评测目录：`evaluate_results/libero_dino_s_smallvideo_lv1_step052000_official_4gpu_30trials_wait`
+- 权重：`step_052000.pt`，续训设置为 `lambda_video=1.0`、`lambda_action=5.0`、`lr=1e-5`。
+- 30 trials 官方四套结果：
+  - spatial `98.33`
+  - object `99.00`
+  - goal `92.33`
+  - libero_10 `84.33`
+  - overall `93.50`
+- 对比之前：
+  - `step_040000`: overall `93.25`，LIBERO-10 `85.33`；
+  - `step_042000`: overall `93.58`，LIBERO-10 `83.00`；
+  - `step_043400`: overall `92.83`，LIBERO-10 `82.00`。
+- 结论：`lambda_video=1.0` 续训到 52k 没有带来整体突破，overall 接近 42k 但略低；spatial 明显更好，LIBERO-10 比 42k/43.4k 回升但仍低于 40k；goal 掉点较明显。
+- 分任务变化：涨点主要在 `libero_spatial_5`、`libero_10_8`、`libero_10_0`；掉点主要在 `libero_10_6`、`libero_goal_6`、`libero_10_2`、`libero_10_9`、`libero_goal_0`。
+- DINO spatial pooling 实现：`latent_spatial_pool=[1,2]` 是对 `[B,D,T,H,W]` latent 用 `avg_pool3d(kernel=(1,1,2), stride=(1,1,2))`，即只沿宽度方向每相邻两个 patch token 平均；224x448 输入、patch16 时从 `14x28=392` tokens/frame 变成 `14x14=196` tokens/frame。
+- 风险：这种 pooling 会丢掉横向细节和小物体/夹爪接触附近的精定位信息；双相机横向拼接时不会跨相机边界平均，但每个相机内部宽度从 14 列压成 7 列。
+
+## 四十四、2026-05-21 no-pooling DINO frame cache
+
+- 已生成 `latent_spatial_pool=[1,1]` 的 DINO-S frame-level cache：
+  - 目录：`data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact`
+  - 日志：`logs/precompute_dino_latents_pool1x1_frame_20260521_125905.log`
+- 运行设置：
+  - `task=libero_dino_s_smallvideo_2cam_224_1e-4`
+  - `dino_latent_cache_mode=frame`
+  - `model.dino_config.latent_spatial_pool=[1,1]`
+  - 4 卡：`CUDA_VISIBLE_DEVICES=4,5,6,7`
+  - `dino_precompute_batch_size=32`
+  - `dino_precompute_num_workers=24`
+- 校验结果：
+  - metadata `total_samples=277713`
+  - 实际 frame cache 文件数 `277713`
+  - 抽样文件 shape 均为 `(384, 14, 28)`
+  - dtype 为 `torch.bfloat16`
+  - finite 检查通过
+- 训练 no-pooling 模型时要保持：
+  - `data.train.dino_latent_cache_dir=./data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact`
+  - `data.train.dino_latent_cache_mode=frame`
+  - `data.train.dino_latent_cache_required=true`
+  - `model.dino_config.load_backbone=false`
+  - `model.dino_config.latent_spatial_pool=[1,1]`

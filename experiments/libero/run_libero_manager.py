@@ -68,6 +68,7 @@ def run_evaluation(
     max_tasks_per_gpu: int,
     output_dir: Path,
     extra_overrides: list[str],
+    thread_env: dict[str, str],
 ) -> None:
     script_path = Path("experiments/libero/run_libero_parallel_test.sh")
     if not script_path.exists():
@@ -93,6 +94,7 @@ def run_evaluation(
             "EXP_NAME": os.environ.get("EXP_NAME", ""),
         }
     )
+    env.update(thread_env)
 
     print("\nStarting evaluation (Hydra manager)...")
     print(f"task: {task_choice}")
@@ -101,6 +103,10 @@ def run_evaluation(
     print(f"Trials per task: {num_trials}")
     print(f"Max tasks per GPU: {max_tasks_per_gpu}")
     print(f"Output directory: {output_dir}")
+    print(
+        "Worker thread limits: "
+        + ", ".join(f"{key}={value}" for key, value in sorted(thread_env.items()))
+    )
     if extra_args:
         print(f"Forwarded overrides: {extra_args}")
 
@@ -156,6 +162,12 @@ def main(cfg: DictConfig):
         max_tasks_per_gpu=int(manager.max_tasks_per_gpu),
         output_dir=output_dir,
         extra_overrides=collect_worker_overrides(),
+        thread_env={
+            "OMP_NUM_THREADS": str(manager.get("omp_num_threads", 2)),
+            "MKL_NUM_THREADS": str(manager.get("mkl_num_threads", 1)),
+            "OPENBLAS_NUM_THREADS": str(manager.get("openblas_num_threads", 1)),
+            "NUMEXPR_NUM_THREADS": str(manager.get("numexpr_num_threads", 1)),
+        },
     )
 
 

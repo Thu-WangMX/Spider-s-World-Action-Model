@@ -50,6 +50,10 @@ MULTIRUN:
     - libero_object
   num_gpus: 8
   max_tasks_per_gpu: 2
+  omp_num_threads: 2
+  mkl_num_threads: 1
+  openblas_num_threads: 1
+  numexpr_num_threads: 1
 
 hydra:
   job:

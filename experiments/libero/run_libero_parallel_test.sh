@@ -29,6 +29,11 @@ run_libero_eval() {
     export EXP_NAME
     PYTHON_BIN=${PYTHON:-python}
     export PYTHON_BIN
+    OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
+    MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+    OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+    NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
+    export OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS
 
     echo "EXP_NAME: $EXP_NAME"
     
@@ -274,6 +279,7 @@ run_libero_eval() {
     echo "ROOT_DIR: $ROOT_DIR"
     echo "NUM_GPUS: $NUM_GPUS"
     echo "MAX_TASKS_PER_GPU: $MAX_TASKS_PER_GPU"
+    echo "Worker thread limits: OMP_NUM_THREADS=$OMP_NUM_THREADS MKL_NUM_THREADS=$MKL_NUM_THREADS OPENBLAS_NUM_THREADS=$OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS=$NUMEXPR_NUM_THREADS"
     
     # Initialize GPU load tracking
     init_gpu_load_tracking
@@ -352,6 +358,7 @@ run_libero_eval() {
         tmux select-pane -t $SESSION_NAME:$pane_info 2>/dev/null
         tmux send-keys -t $SESSION_NAME:$pane_info "clear" C-m 2>/dev/null
         tmux send-keys -t $SESSION_NAME:$pane_info "source ~/.bashrc && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
+            export OMP_NUM_THREADS=$OMP_NUM_THREADS MKL_NUM_THREADS=$MKL_NUM_THREADS OPENBLAS_NUM_THREADS=$OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS=$NUMEXPR_NUM_THREADS && \
             STATUS_FILE='$status_file' LOG_FILE='$log_file' RESULT_FILE='$result_file' && \
             CUDA_VISIBLE_DEVICES=$gpu_id $PYTHON_BIN experiments/libero/eval_libero_single.py \
             task=$CONFIG ckpt=$CKPT \

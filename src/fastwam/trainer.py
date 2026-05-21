@@ -710,7 +710,8 @@ class Wan22Trainer:
             if "epoch" in payload and "batch_in_epoch" in payload:
                 self.epoch = int(payload["epoch"])
                 self.batch_in_epoch = int(payload["batch_in_epoch"])
-                self.train_sampler.set_epoch_offset(self.epoch)
+                self.train_sampler.set_epoch(self.epoch)
+                self.train_sampler.set_epoch_offset(0)
                 self.train_sampler.set_resume_batch_offset(self.batch_in_epoch)
                 logger.info(
                     "Restored dataloader progress: epoch=%d batch_in_epoch=%d sample_offset=%d",
@@ -753,6 +754,7 @@ class Wan22Trainer:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
 
         logger.info("Starting training with max_steps=%d.", self.max_steps)
+        self.train_sampler.set_epoch(self.epoch)
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
@@ -765,6 +767,7 @@ class Wan22Trainer:
                 self.epoch += 1
                 self.batch_in_epoch = 0
                 self.train_sampler.clear_resume_batch_offset()
+                self.train_sampler.set_epoch(self.epoch)
                 data_iter = iter(self.train_loader)
                 continue
 
