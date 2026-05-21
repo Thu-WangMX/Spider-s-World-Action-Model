@@ -1380,3 +1380,62 @@ python experiments/libero/run_libero_manager.py \
   - `data.train.dino_latent_cache_required=true`
   - `model.dino_config.load_backbone=false`
   - `model.dino_config.latent_spatial_pool=[1,1]`
+
+## 四十五、2026-05-21 当前评测结论与下一步
+
+### 评测结果
+
+当前最有参考价值的是 smallvideo + DINO-S + frame cache 这一组：
+
+| checkpoint | spatial | object | goal | libero_10 | overall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| step 040000 | 96.00 | 98.33 | 93.33 | 85.33 | 93.25 |
+| step 042000 | 96.67 | 99.33 | 95.33 | 83.00 | 93.58 |
+| step 043400 | 95.67 | 99.00 | 94.67 | 82.00 | 92.83 |
+| step 052000 (`lambda_video=1.0`) | 98.33 | 99.00 | 92.33 | 84.33 | 93.50 |
+
+- `step_042000` 是当前 overall 最好：`93.58`。
+- `step_040000` 是当前 LIBERO-10 最好：`85.33`。
+- `step_052000` 的 `lambda_video=1.0` 续训没有带来整体突破；spatial 变强，但 goal 掉点，LIBERO-10 仍低于 40k。
+- 模型不是完全不 work：`spatial/object/goal` 均能到 90%+，说明训练、推理、坐标系、DINO cache 对齐等主逻辑基本是通的。
+- 主要短板是 LIBERO-10，卡在 `82~85%`，和原 FastWAM 官方表现仍有明显差距。
+
+### 当前判断
+
+- DINO 表示是可用的，但当前 video future prediction 对精细交互不够强。
+- PCA 可视化支持这个判断：
+  - predicted DINO 没有坍缩；
+  - 大布局和语义结构能对上；
+  - 但小物体、夹爪接触、放置边界更平滑、更糊；
+  - 动态较大的样本里 predicted future 的运动幅度偏小。
+- 这和 LIBERO-10 瓶颈吻合：LIBERO-10 更依赖多阶段、接触、放置和细粒度状态。
+- `latent_spatial_pool=[1,2]` 也是可疑因素：
+  - 原始 DINO grid 为 `14x28=392 tokens/frame`；
+  - pooling 后变成 `14x14=196 tokens/frame`；
+  - 虽然不会跨双相机边界平均，但每个相机内部横向分辨率从 14 列变 7 列；
+  - 这可能损失小物体/夹爪精定位信息。
+
+### 下一步建议
+
+1. 优先训练 no-pooling 版本：`latent_spatial_pool=[1,1]`
+   - 这是最直接的 ablation，可以回答“spatial pooling 是否损害效果”。
+   - no-pooling frame cache 已经生成好：`data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact`。
+   - 代价是 token 数翻倍，训练更慢、更占显存。
+
+2. 尝试更小/更合理的 video DiT 或 adapter
+   - mentor 的判断有道理：原 FastWAM 蹭了 Wan 预训练视频生成能力；当前 DINO 版如果用较大 DiT 且随机初始化，相当于用 LIBERO 小数据训练一个基座级 video DiT，数据量可能不够。
+   - adapter 或更小 backbone 可能更适合当前数据规模。
+
+3. 对 action 分支做加强，而不是继续只调 video loss
+   - `lambda_video=1.0` 没有明显突破，说明简单加大 video loss 权重不是核心解。
+   - 可以考虑 action-only warmup、action loss schedule、或更稳定的 action 采样/监督。
+
+4. 对 LIBERO-10 失败任务做 targeted 分析
+   - 当前拖后腿的任务主要包括 `libero_10_9`、`libero_10_8`、`libero_10_6` 等多物体/开关/放置类任务。
+   - rollout 视频和失败阶段分析比继续盯平均 loss 更有信息量。
+
+5. 暂时不要继续无脑训当前 `[1,2] + lambda_video=1.0`
+   - 从 40k 到 52k 已经说明没有稳定上升趋势。
+   - 除非只是补曲线点，否则性价比不高。
+
+一句话总结：当前方案已经证明 “DINO future + action” 能跑通并达到约 `93%` overall，但还没追上 FastWAM。下一步最值得尝试的是 no-pooling `[1,1]`，其次是 adapter/更小模型，把问题从“多训一点”转成“表示和模型容量是否匹配”。
