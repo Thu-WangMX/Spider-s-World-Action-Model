@@ -1,8 +1,16 @@
 import os
 import shlex
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
+
+project_root = Path(__file__).resolve().parents[2]
+libero_root = Path(os.environ.get("LIBERO_ROOT", project_root.parent / "LIBERO"))
+for path in (libero_root,):
+    path_str = str(path)
+    if path.exists() and path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
@@ -80,6 +88,9 @@ def run_evaluation(
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     env = os.environ.copy()
+    pythonpath_parts = [str(libero_root)]
+    if env.get("PYTHONPATH"):
+        pythonpath_parts.append(env["PYTHONPATH"])
     env.update(
         {
             "CONFIG": task_choice,
@@ -92,6 +103,7 @@ def run_evaluation(
             "OUTPUT_DIR": str(output_dir),
             "EXTRA_ARGS": extra_args,
             "EXP_NAME": os.environ.get("EXP_NAME", ""),
+            "PYTHONPATH": os.pathsep.join(pythonpath_parts),
         }
     )
     env.update(thread_env)

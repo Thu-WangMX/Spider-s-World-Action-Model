@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-cache")
 # LIBERO init-state files are pickled with older PyTorch behavior.
 os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
@@ -28,9 +29,10 @@ os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 # except ModuleNotFoundError:
 project_root = Path(__file__).resolve().parents[2]
 project_src = project_root / "src"
-for path in (project_src, project_root):
+libero_root = Path(os.environ.get("LIBERO_ROOT", project_root.parent / "LIBERO"))
+for path in (libero_root, project_src, project_root):
     path_str = str(path)
-    if path_str not in sys.path:
+    if path.exists() and path_str not in sys.path:
         sys.path.insert(0, path_str)
 
 from experiments.libero.libero_utils import (
@@ -48,7 +50,7 @@ from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_js
 from fastwam.utils.pytorch_utils import set_global_seed
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from libero.libero import benchmark
-from action_ensembler import ActionEnsembler
+from experiments.libero.action_ensembler import ActionEnsembler
 
 OmegaConf.register_new_resolver("eval", eval)
 OmegaConf.register_new_resolver("max", lambda x: max(x))

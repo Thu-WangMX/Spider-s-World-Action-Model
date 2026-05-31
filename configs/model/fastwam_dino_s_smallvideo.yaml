@@ -12,11 +12,12 @@ skip_dit_load_from_pretrain: false
 # - Shrink only DinoVideoDiT from Wan2.2-5B shape to ActionDiT-scale hidden/FFN dims.
 # - Keep num_heads/attn_head_dim/num_layers matched with ActionDiT for MoT mixed attention.
 video_dit_init_from_wan: false
+video_dit_pretrained_path: checkpoints/DinoVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt
 wan_model_id: "Wan-AI/Wan2.2-TI2V-5B"
 
 dino_config:
   model_name: "dinov3-vits16-timm"
-  model_path: "/data11/wmx/Spider-s-World-Action-Model/checkpoints/dinov3_weights/dinov3_vits16_timm_lvd1689m.safetensors"
+  model_path: "checkpoints/dinov3_weights/dinov3_vits16_timm_lvd1689m.safetensors"
   input_resolution: [224, 224]
   patch_size: 16
   feature_dim: 384
@@ -36,6 +37,13 @@ video_dit_config:
   num_layers: 30
   video_attention_mask_mode: "first_frame_causal"
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  # Optional learnable DINO token merge inside DinoVideoDiT.
+  # Keep [1,1,1] for current behavior. Use [1,1,2] to turn 14x28 no-pool
+  # DINO tokens into 14x14 learned patch tokens while still predicting the
+  # original no-pool DINO velocity target.
+  latent_patch_size: [1, 1, 1]
+  latent_patch_mode: "flat"  # "flat" treats 14x28 as one grid; "view" splits width into latent_num_views.
+  latent_num_views: 1
 
 action_dit_config:
   action_dim: ${data.train.processor.action_output_dim}

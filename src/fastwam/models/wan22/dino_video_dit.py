@@ -7,12 +7,13 @@ WanVideoDiT, but is adapted for DINO patch features as input/output.
 Key differences from WanVideoDiT:
 - in_dim = DINO feature_dim (1024 for ViT-L) instead of VAE channels (48)
 - patch_size = [1, 1, 1] since DINO already produces spatial patches
-- No patchify Conv3d needed; uses a linear projection instead
-- No unpatchify needed; head directly outputs DINO-dim features
+- Optional learnable latent patch merge; defaults to a linear projection
 - Simpler spatial structure: tokens are already at patch level
 """
 
 import math
+import os
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -83,6 +84,25 @@ class DinoVideoDiT(nn.Module):
         use_gradient_checkpointing: Whether to use gradient checkpointing.
     """
 
+    VIDEO_BACKBONE_SKIP_PREFIXES = (
+        "input_projection.",
+        "patch_embedding.",
+        "view_embedding.",
+        "head.",
+        "freqs",
+    )
+    VIDEO_BACKBONE_META_KEYS = (
+        "hidden_dim",
+        "dino_dim",
+        "ffn_dim",
+        "num_layers",
+        "num_heads",
+        "attn_head_dim",
+        "text_dim",
+        "freq_dim",
+        "eps",
+    )
+
     def __init__(
         self,
         hidden_dim: int,
@@ -96,6 +116,9 @@ class DinoVideoDiT(nn.Module):
         num_layers: int = 30,
         video_attention_mask_mode: str = "first_frame_causal",
         use_gradient_checkpointing: bool = False,
+        latent_patch_size: Tuple[int, int, int] = (1, 1, 1),
+        latent_patch_mode: str = "flat",
+        latent_num_views: int = 1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -108,6 +131,32 @@ class DinoVideoDiT(nn.Module):
         self.num_layers = num_layers
         self.video_attention_mask_mode = video_attention_mask_mode
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        if len(latent_patch_size) != 3:
+            raise ValueError(f"`latent_patch_size` must be a 3-tuple/list, got {latent_patch_size}")
+        self.latent_patch_size = tuple(int(v) for v in latent_patch_size)
+        if any(v <= 0 for v in self.latent_patch_size):
+            raise ValueError(f"`latent_patch_size` values must be positive, got {self.latent_patch_size}")
+        self.latent_patch_prod = math.prod(self.latent_patch_size)
+        self.latent_patch_mode = str(latent_patch_mode)
+        if self.latent_patch_mode not in {"flat", "view"}:
+            raise ValueError(
+                f"`latent_patch_mode` must be 'flat' or 'view', got {self.latent_patch_mode!r}"
+            )
+        self.latent_num_views = int(latent_num_views)
+        if self.latent_num_views <= 0:
+            raise ValueError(f"`latent_num_views` must be positive, got {self.latent_num_views}")
+        if self.latent_patch_mode == "flat" and self.latent_num_views != 1:
+            logger.warning(
+                "DinoVideoDiT latent_patch_mode='flat' ignores latent_num_views=%s.",
+                self.latent_num_views,
+            )
+        if self.latent_patch_size[0] != 1:
+            raise ValueError(
+                "DinoVideoDiT currently supports only temporal latent_patch_size=1. "
+                "First-frame conditioning and per-token timestep masking assume that "
+                "each DiT video token belongs to a single original frame; got "
+                f"latent_patch_size={self.latent_patch_size}."
+            )
 
         if num_heads <= 0:
             raise ValueError(f"`num_heads` must be > 0, got {num_heads}")
@@ -116,8 +165,24 @@ class DinoVideoDiT(nn.Module):
         if attn_head_dim % 2 != 0:
             raise ValueError(f"`attn_head_dim` must be even for RoPE, got {attn_head_dim}")
 
-        # Input projection: DINO feature_dim → hidden_dim
-        self.input_projection = nn.Linear(dino_dim, hidden_dim)
+        # Input patchifier: default is one DINO patch per token.  A larger
+        # latent_patch_size is a learnable alternative to fixed DINO avg-pool.
+        if self.latent_patch_size == (1, 1, 1):
+            self.input_projection = nn.Linear(dino_dim, hidden_dim)
+            self.patch_embedding = None
+        else:
+            self.input_projection = None
+            self.patch_embedding = nn.Conv3d(
+                dino_dim,
+                hidden_dim,
+                kernel_size=self.latent_patch_size,
+                stride=self.latent_patch_size,
+            )
+        if self.latent_patch_mode == "view":
+            self.view_embedding = nn.Parameter(torch.zeros(self.latent_num_views, hidden_dim))
+            nn.init.normal_(self.view_embedding, mean=0.0, std=hidden_dim**-0.5)
+        else:
+            self.view_embedding = None
 
         # Text embedding
         self.text_embedding = nn.Sequential(
@@ -142,8 +207,8 @@ class DinoVideoDiT(nn.Module):
             [DiTBlock(hidden_dim, attn_head_dim, num_heads, ffn_dim, eps) for _ in range(num_layers)]
         )
 
-        # Output head: hidden_dim → dino_dim
-        self.head = DinoHead(hidden_dim, dino_dim, eps)
+        # Output head: hidden_dim → original DINO patch group.
+        self.head = DinoHead(hidden_dim, dino_dim * self.latent_patch_prod, eps)
 
         # RoPE frequency tables (3D: temporal + spatial H + spatial W)
         self.freqs = precompute_freqs_cis_3d(attn_head_dim)
@@ -154,6 +219,14 @@ class DinoVideoDiT(nn.Module):
 
         if use_gradient_checkpointing:
             logger.info("DinoVideoDiT: gradient checkpointing enabled.")
+        if self.latent_patch_size != (1, 1, 1):
+            logger.info(
+                "DinoVideoDiT learnable latent patch merge enabled: latent_patch_size=%s, "
+                "latent_patch_mode=%s, latent_num_views=%s",
+                self.latent_patch_size,
+                self.latent_patch_mode,
+                self.latent_num_views,
+            )
 
     def init_from_wan_dit(self, wan_dit_state_dict: dict[str, torch.Tensor]) -> None:
         """Initialize DinoVideoDiT Transformer layers from a Wan2.2 Video DiT state_dict.
@@ -197,6 +270,97 @@ class DinoVideoDiT(nn.Module):
             f"skipped_shape={skipped_shape}"
         )
 
+    @classmethod
+    def backbone_key_set(cls, keys) -> set[str]:
+        return {
+            key
+            for key in keys
+            if not any(
+                key == prefix.rstrip(".") or key.startswith(prefix)
+                for prefix in cls.VIDEO_BACKBONE_SKIP_PREFIXES
+            )
+        }
+
+    def load_preprocessed_backbone(self, video_dit_pretrained_path: str) -> None:
+        """Load a preprocessed DinoVideoDiT backbone payload.
+
+        The payload is produced by ``scripts/preprocess_dino_video_dit_backbone.py``.
+        It initializes Transformer/text/time layers while keeping DINO-specific
+        input/output projections random.
+        """
+        p = Path(video_dit_pretrained_path)
+        if not p.is_absolute():
+            p = Path(__file__).resolve().parents[4] / p
+        if not os.path.isfile(p):
+            raise FileNotFoundError(f"`video_dit_pretrained_path` does not exist: {p}")
+
+        payload = torch.load(str(p), map_location="cpu")
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid DinoVideoDiT backbone payload type from {p}: {type(payload)}")
+
+        policy = payload.get("policy", {})
+        if policy:
+            logger.info("DinoVideoDiT backbone payload policy: %s", policy)
+
+        meta = payload.get("meta")
+        if not isinstance(meta, dict):
+            raise ValueError(f"`meta` must be a dict in {p}, got {type(meta)}")
+        expected_meta = {
+            "hidden_dim": int(self.hidden_dim),
+            "dino_dim": int(self.dino_dim),
+            "ffn_dim": int(self.ffn_dim),
+            "num_layers": int(self.num_layers),
+            "num_heads": int(self.num_heads),
+            "attn_head_dim": int(self.attn_head_dim),
+            "text_dim": int(self.text_dim),
+            "freq_dim": int(self.freq_dim),
+        }
+        for key in self.VIDEO_BACKBONE_META_KEYS:
+            if key not in meta:
+                raise ValueError(f"`meta.{key}` missing in {p}")
+            if key == "eps":
+                continue
+            if int(meta[key]) != expected_meta[key]:
+                raise ValueError(
+                    f"`meta.{key}` mismatch in {p}: expected {expected_meta[key]}, got {meta[key]}"
+                )
+
+        backbone_state_dict = payload.get("backbone_state_dict")
+        if not isinstance(backbone_state_dict, dict):
+            raise ValueError(f"`backbone_state_dict` must be a dict in {p}, got {type(backbone_state_dict)}")
+
+        own_state = self.state_dict()
+        expected_backbone_keys = self.backbone_key_set(own_state.keys())
+        provided_keys = set(backbone_state_dict.keys())
+        missing_keys = sorted(expected_backbone_keys - provided_keys)
+        unexpected_keys = sorted(provided_keys - expected_backbone_keys)
+        if missing_keys or unexpected_keys:
+            raise ValueError(
+                "DinoVideoDiT backbone key mismatch in preprocessed payload. "
+                f"missing={missing_keys[:10]}{'...' if len(missing_keys) > 10 else ''}, "
+                f"unexpected={unexpected_keys[:10]}{'...' if len(unexpected_keys) > 10 else ''}"
+            )
+
+        merged_state = dict(own_state)
+        for key in expected_backbone_keys:
+            value = backbone_state_dict[key]
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"`backbone_state_dict[{key}]` must be torch.Tensor in {p}, got {type(value)}")
+            target = merged_state[key]
+            if tuple(value.shape) != tuple(target.shape):
+                raise ValueError(
+                    f"Shape mismatch for `{key}` in {p}: expected {tuple(target.shape)}, got {tuple(value.shape)}"
+                )
+            merged_state[key] = value.to(device=target.device, dtype=target.dtype)
+
+        self.load_state_dict(merged_state, strict=True)
+        logger.info(
+            "Loaded DinoVideoDiT backbone from %s (keys=%d; random_kept_prefixes=%s).",
+            p,
+            len(expected_backbone_keys),
+            list(self.VIDEO_BACKBONE_SKIP_PREFIXES),
+        )
+
     def build_video_to_video_mask(
         self,
         video_seq_len: int,
@@ -234,6 +398,147 @@ class DinoVideoDiT(nn.Module):
 
         raise ValueError(f"Unsupported video attention mask mode: {self.video_attention_mask_mode}")
 
+    def patchify(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert DINO latents to DiT tokens.
+
+        For the default patch size this is equivalent to the old per-patch
+        linear projection.  For larger patch sizes this uses a learnable Conv3d
+        patch embedding, matching the original WanVideoDiT pattern.
+        """
+        if self.latent_patch_size == (1, 1, 1):
+            if self.latent_patch_mode == "view":
+                x_tokens = self._view_rearrange_latents(x)
+                x_tokens = rearrange(x_tokens, "b v d t h w -> b (t v h w) d")
+            else:
+                x_tokens = rearrange(x, "b d t h w -> b (t h w) d")
+            assert self.input_projection is not None
+            return self.input_projection(x_tokens)
+        assert self.patch_embedding is not None
+        if self.latent_patch_mode == "view":
+            x = self._view_rearrange_latents(x)
+            batch_size, num_views = x.shape[:2]
+            x = rearrange(x, "b v d t h w -> (b v) d t h w")
+            x = self.patch_embedding(x)
+            x = rearrange(x, "(b v) d t h w -> b (t v h w) d", b=batch_size, v=num_views)
+        else:
+            x = self.patch_embedding(x)
+            x = rearrange(x, "b d t h w -> b (t h w) d")
+        return x
+
+    def unpatchify(self, x_tokens: torch.Tensor, grid_size: Tuple[int, int, int]) -> torch.Tensor:
+        f, h, w = grid_size
+        pt, ph, pw = self.latent_patch_size
+        if self.latent_patch_mode == "view":
+            num_views = self.latent_num_views
+            if self.latent_patch_size == (1, 1, 1):
+                return rearrange(
+                    x_tokens,
+                    "b (t v h w) d -> b d t h (v w)",
+                    v=num_views,
+                    t=f,
+                    h=h,
+                    w=w,
+                )
+            return rearrange(
+                x_tokens,
+                "b (t v h w) (d pt ph pw) -> b d (t pt) (h ph) (v w pw)",
+                v=num_views,
+                t=f,
+                h=h,
+                w=w,
+                pt=pt,
+                ph=ph,
+                pw=pw,
+            )
+        if self.latent_patch_size == (1, 1, 1):
+            return rearrange(x_tokens, "b (t h w) d -> b d t h w", t=f, h=h, w=w)
+        return rearrange(
+            x_tokens,
+            "b (t h w) (d pt ph pw) -> b d (t pt) (h ph) (w pw)",
+            t=f,
+            h=h,
+            w=w,
+            pt=pt,
+            ph=ph,
+            pw=pw,
+        )
+
+    def _view_rearrange_latents(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] % self.latent_num_views != 0:
+            raise ValueError(
+                "DINO latent width must be divisible by latent_num_views for view-aware patching, "
+                f"got width={x.shape[-1]} and latent_num_views={self.latent_num_views}."
+            )
+        return rearrange(x, "b d t h (v w) -> b v d t h w", v=self.latent_num_views)
+
+    def _add_view_embedding(
+        self,
+        tokens: torch.Tensor,
+        patched_frames: int,
+        patched_h: int,
+        patched_w: int,
+    ) -> torch.Tensor:
+        if self.latent_patch_mode != "view":
+            return tokens
+        assert self.view_embedding is not None
+        batch_size, seq_len, hidden_dim = tokens.shape
+        expected_seq_len = patched_frames * self.latent_num_views * patched_h * patched_w
+        if seq_len != expected_seq_len:
+            raise ValueError(
+                "View-aware token sequence length mismatch, "
+                f"got seq_len={seq_len}, expected={expected_seq_len} from "
+                f"grid={(patched_frames, self.latent_num_views, patched_h, patched_w)}."
+            )
+        view_emb = self.view_embedding.to(device=tokens.device, dtype=tokens.dtype)
+        view_emb = view_emb.view(1, 1, self.latent_num_views, 1, 1, hidden_dim)
+        tokens = tokens.reshape(
+            batch_size,
+            patched_frames,
+            self.latent_num_views,
+            patched_h,
+            patched_w,
+            hidden_dim,
+        )
+        tokens = tokens + view_emb
+        return tokens.reshape(batch_size, seq_len, hidden_dim)
+
+    def _build_rope_freqs(
+        self,
+        patched_frames: int,
+        patched_h: int,
+        patched_w: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        freqs = torch.cat(
+            [
+                self.freqs[0][:patched_frames].view(patched_frames, 1, 1, -1).expand(
+                    patched_frames, patched_h, patched_w, -1
+                ),
+                self.freqs[1][:patched_h].view(1, patched_h, 1, -1).expand(
+                    patched_frames, patched_h, patched_w, -1
+                ),
+                self.freqs[2][:patched_w].view(1, 1, patched_w, -1).expand(
+                    patched_frames, patched_h, patched_w, -1
+                ),
+            ],
+            dim=-1,
+        )
+        if self.latent_patch_mode == "view":
+            freqs = freqs.unsqueeze(1).expand(
+                patched_frames,
+                self.latent_num_views,
+                patched_h,
+                patched_w,
+                -1,
+            )
+            return freqs.reshape(
+                patched_frames * self.latent_num_views * patched_h * patched_w,
+                1,
+                -1,
+            ).to(device)
+        freqs = freqs.reshape(patched_frames * patched_h * patched_w, 1, -1)
+        return freqs.to(device)
+
     def pre_dit(
         self,
         x: torch.Tensor,
@@ -261,7 +566,28 @@ class DinoVideoDiT(nn.Module):
             raise ValueError(f"`x` must be 5D [B, D, T, H, W], got shape {tuple(x.shape)}")
 
         batch_size, dino_dim, num_frames, height_grid, width_grid = x.shape
-        tokens_per_frame = height_grid * width_grid
+        patch_t, patch_h, patch_w = self.latent_patch_size
+        patch_width_grid = width_grid
+        if self.latent_patch_mode == "view":
+            if width_grid % self.latent_num_views != 0:
+                raise ValueError(
+                    "DINO latent width must be divisible by latent_num_views for view-aware patching, "
+                    f"got width={width_grid} and latent_num_views={self.latent_num_views}."
+                )
+            patch_width_grid = width_grid // self.latent_num_views
+        if num_frames % patch_t != 0 or height_grid % patch_h != 0 or patch_width_grid % patch_w != 0:
+            raise ValueError(
+                "DINO latent grid must be divisible by latent_patch_size, "
+                f"got grid={(num_frames, height_grid, patch_width_grid)} "
+                f"(original width={width_grid}, mode={self.latent_patch_mode}) and "
+                f"latent_patch_size={self.latent_patch_size}."
+            )
+        patched_frames = num_frames // patch_t
+        patched_h = height_grid // patch_h
+        patched_w = patch_width_grid // patch_w
+        tokens_per_frame = patched_h * patched_w
+        if self.latent_patch_mode == "view":
+            tokens_per_frame *= self.latent_num_views
 
         if context.ndim != 3:
             raise ValueError(f"`context` must be 3D [B, L, D], got shape {tuple(context.shape)}")
@@ -279,7 +605,7 @@ class DinoVideoDiT(nn.Module):
         # Time embedding with per-token timestep (first frame = 0 if fuse mode)
         if fuse_vae_embedding_in_latents:
             token_timesteps = torch.ones(
-                (batch_size, num_frames, tokens_per_frame),
+                (batch_size, patched_frames, tokens_per_frame),
                 dtype=timestep.dtype,
                 device=timestep.device,
             ) * timestep.view(batch_size, 1, 1)
@@ -293,28 +619,28 @@ class DinoVideoDiT(nn.Module):
             t = self.time_embedding(t_emb)
             t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
 
-        # Reshape DINO features to token sequence: [B, D, T, H, W] → [B, T*H*W, D]
-        x_tokens = rearrange(x, "b d t h w -> b (t h w) d")
-
-        # Project from DINO dim to hidden dim
-        x_tokens = self.input_projection(x_tokens)
+        x_tokens = self.patchify(x)
+        x_tokens = self._add_view_embedding(
+            x_tokens,
+            patched_frames=patched_frames,
+            patched_h=patched_h,
+            patched_w=patched_w,
+        )
 
         # Text embedding
         context_emb = self.text_embedding(context)
 
         # Expand context mask for cross-attention: [B, L] → [B, seq_len, L]
-        seq_len = num_frames * height_grid * width_grid
+        seq_len = patched_frames * tokens_per_frame
         context_mask_expanded = context_mask.unsqueeze(1).expand(-1, seq_len, -1)
 
         # RoPE frequencies
-        freqs = torch.cat(
-            [
-                self.freqs[0][:num_frames].view(num_frames, 1, 1, -1).expand(num_frames, height_grid, width_grid, -1),
-                self.freqs[1][:height_grid].view(1, height_grid, 1, -1).expand(num_frames, height_grid, width_grid, -1),
-                self.freqs[2][:width_grid].view(1, 1, width_grid, -1).expand(num_frames, height_grid, width_grid, -1),
-            ],
-            dim=-1,
-        ).reshape(num_frames * height_grid * width_grid, 1, -1).to(x_tokens.device)
+        freqs = self._build_rope_freqs(
+            patched_frames=patched_frames,
+            patched_h=patched_h,
+            patched_w=patched_w,
+            device=x_tokens.device,
+        )
 
         return {
             "tokens": x_tokens,
@@ -324,7 +650,11 @@ class DinoVideoDiT(nn.Module):
             "context": context_emb,
             "context_mask": context_mask_expanded,
             "meta": {
-                "grid_size": (num_frames, height_grid, width_grid),
+                "grid_size": (patched_frames, patched_h, patched_w),
+                "original_grid_size": (num_frames, height_grid, width_grid),
+                "latent_patch_size": self.latent_patch_size,
+                "latent_patch_mode": self.latent_patch_mode,
+                "latent_num_views": self.latent_num_views,
                 "tokens_per_frame": tokens_per_frame,
                 "batch_size": batch_size,
             },
@@ -340,16 +670,12 @@ class DinoVideoDiT(nn.Module):
         Returns:
             [B, D_dino, T, H_grid, W_grid] predicted velocity in DINO space.
         """
-        num_frames, height_grid, width_grid = pre_state["meta"]["grid_size"]
+        grid_size = pre_state["meta"]["grid_size"]
 
-        # Apply output head: [B, seq_len, hidden_dim] → [B, seq_len, dino_dim]
+        # Apply output head: [B, seq_len, hidden_dim] → original DINO patch group.
         x = self.head(x_tokens, pre_state["t"])
 
-        # Reshape back to spatial format: [B, seq_len, D] → [B, D, T, H, W]
-        x = rearrange(
-            x, "b (t h w) d -> b d t h w", t=num_frames, h=height_grid, w=width_grid
-        )
-        return x
+        return self.unpatchify(x, grid_size)
 
     def forward(
         self,

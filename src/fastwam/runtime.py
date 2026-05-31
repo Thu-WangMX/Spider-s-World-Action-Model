@@ -258,6 +258,7 @@ def create_fastwam_dino(
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     video_dit_init_from_wan: bool = False,
+    video_dit_pretrained_path: str | None = None,
     wan_model_id: str = "Wan-AI/Wan2.2-TI2V-5B",
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
@@ -327,6 +328,7 @@ def create_fastwam_dino(
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         video_dit_init_from_wan=bool(video_dit_init_from_wan),
+        video_dit_pretrained_path=video_dit_pretrained_path,
         wan_model_id=str(wan_model_id),
     )
 
@@ -448,6 +450,7 @@ def run_training(cfg: DictConfig):
         log_level=logging.INFO,
         is_main_process=torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True,
     )
+    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     misc.register_work_dir(cfg.output_dir)
     config_payload = OmegaConf.to_container(cfg, resolve=True)
     with open(Path(cfg.output_dir) / "config.yaml", "w") as f:

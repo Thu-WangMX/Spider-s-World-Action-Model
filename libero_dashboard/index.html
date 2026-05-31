@@ -1,0 +1,733 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LIBERO Eval History</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d8dee8;
+      --line-strong: #b7c1cf;
+      --text: #18202b;
+      --muted: #697586;
+      --green: #177245;
+      --green-soft: #e7f5ee;
+      --red: #b42318;
+      --red-soft: #fde9e7;
+      --blue: #1d5f9f;
+      --blue-soft: #e8f1fb;
+      --amber: #916400;
+      --amber-soft: #fff4d6;
+      --ink-soft: #eef1f5;
+      --shadow: 0 10px 30px rgba(17, 24, 39, 0.07);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(246, 247, 249, 0.95);
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(10px);
+    }
+
+    .wrap {
+      max-width: 1560px;
+      margin: 0 auto;
+      padding: 16px 20px;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: center;
+    }
+
+    h1 {
+      margin: 0 0 3px;
+      font-size: 22px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+      align-items: center;
+    }
+
+    button,
+    select {
+      border: 1px solid var(--line-strong);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 6px;
+      min-height: 34px;
+      padding: 6px 10px;
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+      font-weight: 650;
+    }
+
+    button.active {
+      background: var(--text);
+      border-color: var(--text);
+      color: white;
+    }
+
+    main.wrap {
+      display: grid;
+      gap: 16px;
+      padding-top: 18px;
+      padding-bottom: 42px;
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(150px, 1fr));
+      gap: 12px;
+    }
+
+    .metric,
+    .panel,
+    .task-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    .metric {
+      padding: 12px 14px;
+      min-height: 88px;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .value {
+      margin-top: 5px;
+      font-size: 26px;
+      font-weight: 760;
+      letter-spacing: 0;
+    }
+
+    .detail {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .panel {
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: center;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfe;
+    }
+
+    .panel-title {
+      font-size: 15px;
+      font-weight: 760;
+    }
+
+    .panel-body {
+      padding: 14px;
+    }
+
+    .chart {
+      width: 100%;
+      height: 310px;
+      display: block;
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-right: 6px;
+      border-radius: 2px;
+      background: var(--c);
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 1180px;
+      font-size: 13px;
+    }
+
+    th, td {
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: right;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+
+    th:first-child,
+    td:first-child,
+    th:nth-child(2),
+    td:nth-child(2) {
+      text-align: left;
+    }
+
+    th {
+      color: var(--muted);
+      background: #fbfcfe;
+      font-size: 12px;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+
+    tr:hover td {
+      background: #f8fafc;
+    }
+
+    .path {
+      max-width: 320px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      border: 1px solid transparent;
+    }
+
+    .badge.valid { color: var(--green); background: var(--green-soft); border-color: #bde5d2; }
+    .badge.invalid { color: var(--red); background: var(--red-soft); border-color: #f5b9b4; }
+    .badge.warn { color: var(--amber); background: var(--amber-soft); border-color: #f1d28a; }
+    .badge.info { color: var(--blue); background: var(--blue-soft); border-color: #bfd8f4; }
+    .badge.plain { color: var(--text); background: var(--ink-soft); border-color: var(--line); }
+
+    .score-good { color: var(--green); font-weight: 760; }
+    .score-mid { color: var(--amber); font-weight: 760; }
+    .score-bad { color: var(--red); font-weight: 760; }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .movers {
+      display: grid;
+      gap: 8px;
+    }
+
+    .move-row {
+      display: grid;
+      grid-template-columns: 82px 78px 1fr;
+      gap: 10px;
+      align-items: start;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .move-row:last-child {
+      border-bottom: 0;
+    }
+
+    .task-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .task-card {
+      padding: 12px;
+      box-shadow: none;
+    }
+
+    .task-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: flex-start;
+      margin-bottom: 8px;
+    }
+
+    .task-title {
+      font-weight: 760;
+      overflow-wrap: anywhere;
+    }
+
+    .video-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    video {
+      width: 100%;
+      aspect-ratio: 16 / 10;
+      background: #111827;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      display: block;
+    }
+
+    .empty {
+      padding: 18px;
+      color: var(--muted);
+      background: #fbfcfe;
+      border: 1px dashed var(--line-strong);
+      border-radius: 6px;
+    }
+
+    @media (max-width: 1100px) {
+      .topbar,
+      .grid-2 {
+        grid-template-columns: 1fr;
+      }
+      .controls {
+        justify-content: flex-start;
+      }
+      .metric-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .task-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .wrap { padding-left: 12px; padding-right: 12px; }
+      .metric-grid { grid-template-columns: 1fr; }
+      .video-row { grid-template-columns: 1fr; }
+      h1 { font-size: 19px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap topbar">
+      <div>
+        <h1>LIBERO 评测历史面板</h1>
+        <div class="subtitle" id="status">加载中...</div>
+      </div>
+      <div class="controls">
+        <button id="validOnly" class="active" type="button">只看有效结果</button>
+        <button id="showAll" type="button">显示全部历史</button>
+        <select id="badcaseSelect" title="选择 badcase 来源评测"></select>
+        <button id="refresh" type="button">刷新</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="metric-grid" id="metrics"></section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <div class="panel-title">成功率时间线</div>
+          <div class="detail">横轴按评测时间从旧到新排列；默认忽略 invalid 结果。</div>
+        </div>
+        <span class="badge info" id="chartCount">0 evals</span>
+      </div>
+      <div class="panel-body">
+        <svg id="trend" class="chart" role="img" aria-label="LIBERO success-rate trend chart"></svg>
+        <div class="legend" id="legend"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <div class="panel-title">全部评测记录</div>
+          <div class="detail">自动扫描 evaluate_results/**/summary.json；最左侧时间来自 summary.json 文件生成/修改时间；展示顺序按时间从旧到新排序，越新的评测记录越靠下。</div>
+        </div>
+        <span class="badge plain" id="evalCount">0 rows</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>状态</th>
+              <th>评测</th>
+              <th>step</th>
+              <th>Spatial</th>
+              <th>Object</th>
+              <th>Goal</th>
+              <th>LIBERO-10</th>
+              <th>Overall</th>
+              <th>trials</th>
+              <th>global batch</th>
+              <th>lr</th>
+              <th>λ video</th>
+              <th>pooling</th>
+              <th>模型</th>
+              <th>resume</th>
+              <th>路径</th>
+            </tr>
+          </thead>
+          <tbody id="evalRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">最近一次有效评测的任务变化</div>
+            <div class="detail">相对上一条有效评测，列出变化超过 6 个百分点的 task。</div>
+          </div>
+        </div>
+        <div class="panel-body movers" id="movers"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">当前训练状态</div>
+            <div class="detail">从最新 run 目录读取最近权重和日志线索。</div>
+          </div>
+        </div>
+        <div class="panel-body" id="trainingState"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <div class="panel-title">低成功率 Task 与 Badcase 视频</div>
+          <div class="detail">下拉选择某一次评测后，只展示该次评测的低分 task 和失败 rollout 视频；后台自动刷新不会重绘正在看的视频区。</div>
+          <div class="detail" id="badcaseEvalNote">当前展示: -</div>
+        </div>
+        <span class="badge warn" id="badcaseCount">0 tasks</span>
+      </div>
+      <div class="panel-body">
+        <div class="task-grid" id="badcases"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const colors = {
+      overall: "#18202b",
+      libero_spatial: "#177245",
+      libero_object: "#1d5f9f",
+      libero_goal: "#916400",
+      libero_10: "#b42318"
+    };
+    const suiteLabels = {
+      libero_spatial: "Spatial",
+      libero_object: "Object",
+      libero_goal: "Goal",
+      libero_10: "LIBERO-10"
+    };
+
+    let dashboard = null;
+    let validOnly = true;
+    let dataSignature = "";
+
+    const $ = (id) => document.getElementById(id);
+    const pct = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : "-";
+    const shortPath = (s) => s ? s.replace(/^.*Spider-s-World-Action-Model\//, "") : "-";
+
+    function clsScore(v) {
+      if (!Number.isFinite(Number(v))) return "";
+      if (v >= 93) return "score-good";
+      if (v >= 85) return "score-mid";
+      return "score-bad";
+    }
+
+    function selectedEvals() {
+      const evals = dashboard ? dashboard.evals : [];
+      return validOnly ? evals.filter(e => e.meta.valid !== false) : evals;
+    }
+
+    function signatureOf(data) {
+      return (data.evals || []).map(e => `${e.id}:${e.mtime}:${e.overall}`).join("|") + `::${data.training_state?.latest_weight || ""}`;
+    }
+
+    async function loadData(options = {}) {
+      const res = await fetch(`dashboard_data.json?ts=${Date.now()}`, { cache: "no-store" });
+      const next = await res.json();
+      const nextSignature = signatureOf(next);
+      const unchanged = dashboard && nextSignature === dataSignature;
+      dashboard = next;
+      if (unchanged && options.auto) {
+        $("status").textContent = `数据生成: ${dashboard.generated_at} | 根目录: ${dashboard.root}`;
+        return;
+      }
+      dataSignature = nextSignature;
+      render({ preserveBadcases: options.auto });
+    }
+
+    function render(options = {}) {
+      const evals = selectedEvals();
+      const valid = dashboard.evals.filter(e => e.meta.valid !== false);
+      const best = valid.find(e => e.id === dashboard.best_eval_id);
+      const latest = dashboard.evals.find(e => e.id === dashboard.latest_eval_id);
+      const latestValid = valid.find(e => e.id === dashboard.latest_valid_eval_id) || [...valid].reverse()[0];
+      $("status").textContent = `数据生成: ${dashboard.generated_at} | 根目录: ${dashboard.root}`;
+      $("metrics").innerHTML = [
+        metric("有效评测", valid.length, `总记录 ${dashboard.evals.length}`),
+        metric("当前最佳 Overall", best ? `${pct(best.overall)}%` : "-", best ? best.id : "-"),
+        metric("最佳 LIBERO-10", bestSuite(valid, "libero_10"), bestSuiteLabel(valid, "libero_10")),
+        metric("最新有效评测", latestValid ? `${pct(latestValid.overall)}%` : "-", latestValid ? latestValid.id : "-"),
+        metric("最新权重", dashboard.training_state?.latest_weight_step ?? "-", dashboard.training_state?.run_dir ?? "-")
+      ].join("");
+      renderTable(evals);
+      renderTrend(evals);
+      renderBadcaseSelect();
+      if (!options.preserveBadcases) {
+        renderBadcases();
+      } else {
+        updateBadcaseNote();
+      }
+      renderMovers();
+      renderTraining();
+    }
+
+    function metric(label, value, detail) {
+      return `<div class="metric"><div class="label">${label}</div><div class="value">${value}</div><div class="detail">${detail || ""}</div></div>`;
+    }
+
+    function bestSuite(evals, suite) {
+      const best = [...evals].sort((a, b) => (b.suites[suite]?.score ?? -1) - (a.suites[suite]?.score ?? -1))[0];
+      return best ? `${pct(best.suites[suite].score)}%` : "-";
+    }
+
+    function bestSuiteLabel(evals, suite) {
+      const best = [...evals].sort((a, b) => (b.suites[suite]?.score ?? -1) - (a.suites[suite]?.score ?? -1))[0];
+      return best ? `${best.id}` : "-";
+    }
+
+    function renderTable(evals) {
+      $("evalCount").textContent = `${evals.length} rows`;
+      $("evalRows").innerHTML = evals.map(e => {
+        const status = e.meta.valid === false
+          ? `<span class="badge invalid" title="${e.meta.warning || ""}">invalid</span>`
+          : `<span class="badge valid">valid</span>`;
+        const trials = e.suites.libero_spatial?.trials ?? e.suites.libero_10?.trials ?? "-";
+        const warn = e.meta.warning ? `<div class="detail">${e.meta.warning}</div>` : "";
+        return `<tr>
+          <td title="${e.mtime_text || ""}">${e.eval_date || "-"}</td>
+          <td>${status}</td>
+          <td><strong>${e.id}</strong>${warn}</td>
+          <td>${e.step ?? "-"}</td>
+          ${["libero_spatial", "libero_object", "libero_goal", "libero_10"].map(s => `<td class="${clsScore(e.suites[s]?.score)}">${pct(e.suites[s]?.score)}</td>`).join("")}
+          <td class="${clsScore(e.overall)}">${pct(e.overall)}</td>
+          <td>${trials}</td>
+          <td>${e.meta.global_batch ?? "-"}</td>
+          <td>${e.meta.learning_rate ?? "-"}</td>
+          <td>${e.meta.lambda_video ?? "-"}</td>
+          <td>${e.meta.pooling ?? "-"}</td>
+          <td>${e.meta.model ?? "-"}</td>
+          <td>${e.meta.resume_type ?? "-"}</td>
+          <td class="path" title="${e.eval_dir}">${e.eval_dir}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    function renderTrend(evals) {
+      $("chartCount").textContent = `${evals.length} evals`;
+      const svg = $("trend");
+      const w = svg.clientWidth || 1000;
+      const h = svg.clientHeight || 310;
+      const pad = { l: 52, r: 18, t: 20, b: 54 };
+      const innerW = w - pad.l - pad.r;
+      const innerH = h - pad.t - pad.b;
+      const yMin = Math.max(0, Math.floor(Math.min(...evals.flatMap(e => [e.overall, ...Object.values(e.suites).map(s => s.score)]).filter(Number.isFinite)) / 5) * 5 - 5);
+      const yMax = 100;
+      const x = (i) => pad.l + (evals.length <= 1 ? innerW / 2 : i * innerW / (evals.length - 1));
+      const y = (v) => pad.t + (yMax - v) * innerH / (yMax - yMin);
+      const series = [
+        ["overall", "Overall", e => e.overall],
+        ["libero_spatial", "Spatial", e => e.suites.libero_spatial?.score],
+        ["libero_object", "Object", e => e.suites.libero_object?.score],
+        ["libero_goal", "Goal", e => e.suites.libero_goal?.score],
+        ["libero_10", "LIBERO-10", e => e.suites.libero_10?.score],
+      ];
+      let html = `<rect x="0" y="0" width="${w}" height="${h}" fill="#fff"/>`;
+      for (let tick = Math.ceil(yMin / 5) * 5; tick <= yMax; tick += 5) {
+        const yy = y(tick);
+        html += `<line x1="${pad.l}" y1="${yy}" x2="${w - pad.r}" y2="${yy}" stroke="#eef1f5"/>`;
+        html += `<text x="${pad.l - 10}" y="${yy + 4}" text-anchor="end" font-size="11" fill="#697586">${tick}</text>`;
+      }
+      evals.forEach((e, i) => {
+        const xx = x(i);
+        html += `<line x1="${xx}" y1="${pad.t}" x2="${xx}" y2="${h - pad.b}" stroke="#f0f2f5"/>`;
+        html += `<text x="${xx}" y="${h - 28}" text-anchor="middle" font-size="10" fill="#697586">${e.step ?? i + 1}</text>`;
+      });
+      series.forEach(([key, label, getter]) => {
+        const pts = evals.map((e, i) => [x(i), y(getter(e)), getter(e)]).filter(p => Number.isFinite(p[2]));
+        if (pts.length < 1) return;
+        html += `<polyline points="${pts.map(p => `${p[0]},${p[1]}`).join(" ")}" fill="none" stroke="${colors[key]}" stroke-width="${key === "overall" ? 3 : 2}" stroke-linejoin="round" stroke-linecap="round"/>`;
+        pts.forEach(p => html += `<circle cx="${p[0]}" cy="${p[1]}" r="3" fill="${colors[key]}"><title>${label}: ${pct(p[2])}%</title></circle>`);
+      });
+      html += `<line x1="${pad.l}" y1="${h - pad.b}" x2="${w - pad.r}" y2="${h - pad.b}" stroke="#b7c1cf"/>`;
+      html += `<line x1="${pad.l}" y1="${pad.t}" x2="${pad.l}" y2="${h - pad.b}" stroke="#b7c1cf"/>`;
+      svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+      svg.innerHTML = html;
+      $("legend").innerHTML = series.map(([key, label]) => `<span style="--c:${colors[key]}">${label}</span>`).join("");
+    }
+
+    function renderBadcaseSelect() {
+      const select = $("badcaseSelect");
+      const current = select.value;
+      select.innerHTML = dashboard.evals.map(e => {
+        const prefix = e.meta.valid === false ? "invalid | " : "";
+        return `<option value="${e.id}">${prefix}${e.id}</option>`;
+      }).join("");
+      if (current && dashboard.evals.some(e => e.id === current)) {
+        select.value = current;
+      } else {
+        const latestValid = [...dashboard.evals].reverse().find(e => e.meta.valid !== false);
+        select.value = latestValid?.id || dashboard.evals.at(-1)?.id || "";
+      }
+    }
+
+    function updateBadcaseNote() {
+      const evalItem = dashboard.evals.find(e => e.id === $("badcaseSelect").value);
+      $("badcaseEvalNote").textContent = evalItem
+        ? `当前展示: ${evalItem.id} | step ${evalItem.step ?? "-"} | Overall ${pct(evalItem.overall)}% | ${evalItem.eval_dir}`
+        : "当前展示: -";
+    }
+
+    function renderBadcases() {
+      const evalItem = dashboard.evals.find(e => e.id === $("badcaseSelect").value);
+      const tasks = evalItem?.bad_tasks || [];
+      updateBadcaseNote();
+      $("badcaseCount").textContent = `${tasks.length} tasks`;
+      if (!tasks.length) {
+        $("badcases").innerHTML = `<div class="empty">这次评测没有低于阈值的 task，或者目录里没有可用视频。</div>`;
+        return;
+      }
+      $("badcases").innerHTML = tasks.map(t => {
+        const videos = (t.fail_videos || []).map(v => `<video controls muted preload="metadata" src="${v.url}" title="${v.path}"></video>`).join("");
+        return `<article class="task-card">
+          <div class="task-head">
+            <div>
+              <div class="task-title">${t.key}: ${t.description || ""}</div>
+              <div class="detail">${t.suite} | ${t.successes ?? "-"} / ${t.total_episodes ?? "-"} | videos ${t.failure_video_count}/${t.video_count}</div>
+            </div>
+            <span class="badge ${Number(t.success_rate) < 70 ? "invalid" : "warn"}">${pct(t.success_rate)}%</span>
+          </div>
+          ${videos ? `<div class="video-row">${videos}</div>` : `<div class="empty">该 task 低分，但当前目录没有失败视频文件。</div>`}
+        </article>`;
+      }).join("");
+    }
+
+    function renderMovers() {
+      const moves = dashboard.movers || [];
+      if (!moves.length) {
+        $("movers").innerHTML = `<div class="empty">最近两条有效评测之间没有超过阈值的 task 变化。</div>`;
+        return;
+      }
+      $("movers").innerHTML = moves.map(m => {
+        const up = m.delta > 0;
+        return `<div class="move-row">
+          <span class="badge ${up ? "valid" : "invalid"}">${up ? "+" : ""}${m.delta.toFixed(2)}</span>
+          <strong>${pct(m.from_score)} → ${pct(m.to_score)}</strong>
+          <div><strong>${m.key}</strong><div class="detail">${m.description}</div></div>
+        </div>`;
+      }).join("");
+    }
+
+    function renderTraining() {
+      const s = dashboard.training_state;
+      if (!s) {
+        $("trainingState").innerHTML = `<div class="empty">没有找到 run 状态。</div>`;
+        return;
+      }
+      $("trainingState").innerHTML = `
+        <div class="label">latest run</div>
+        <div class="detail">${s.run_dir || "-"}</div>
+        <div style="height:10px"></div>
+        <div class="label">latest weight</div>
+        <div class="detail">${s.latest_weight || "-"} ${s.latest_weight_step ? `(step ${s.latest_weight_step})` : ""}</div>
+        <div style="height:10px"></div>
+        <div class="label">log clue</div>
+        <div class="detail">${s.last_line || "-"}</div>
+      `;
+    }
+
+    $("validOnly").addEventListener("click", () => {
+      validOnly = true;
+      $("validOnly").classList.add("active");
+      $("showAll").classList.remove("active");
+      render();
+    });
+    $("showAll").addEventListener("click", () => {
+      validOnly = false;
+      $("showAll").classList.add("active");
+      $("validOnly").classList.remove("active");
+      render();
+    });
+    $("refresh").addEventListener("click", () => loadData({ auto: false }));
+    $("badcaseSelect").addEventListener("change", renderBadcases);
+    window.addEventListener("resize", () => dashboard && renderTrend(selectedEvals()));
+
+    loadData({ auto: false }).catch(err => {
+      $("status").textContent = `加载 dashboard_data.json 失败: ${err}`;
+    });
+    setInterval(() => loadData({ auto: true }).catch(() => {}), 30000);
+  </script>
+</body>
+</html>

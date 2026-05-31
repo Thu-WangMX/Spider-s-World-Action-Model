@@ -12,6 +12,9 @@ output_dir: ./runs/train/${now:%Y-%m-%d}_${now:%H-%M-%S}
 # dataloading
 batch_size: 2
 num_workers: 4
+prefetch_factor: 2
+persistent_workers: false
+pin_memory: true
 
 # scheduler
 lr_scheduler_type: "cosine"
@@ -35,10 +38,11 @@ resume: null
 # scripts/precompute_dino_latents.py; normal training ignores them unless
 # data.train.dino_latent_cache_dir is also set.
 dino_latent_cache_dir: null
-dino_latent_cache_mode: window
+dino_latent_cache_mode: window  # window, frame, or frame_mmap
 dino_precompute_batch_size: 8
 dino_precompute_num_workers: 8
 dino_latent_cache_dtype: bf16
+overwrite: false
 
 # wandb
 wandb:

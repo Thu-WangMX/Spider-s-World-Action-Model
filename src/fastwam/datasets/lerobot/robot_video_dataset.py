@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 from typing import Optional
 import time
@@ -79,11 +80,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.load_text_context = load_text_context
         self.dino_latent_cache_dir = dino_latent_cache_dir
         self.dino_latent_cache_mode = str(dino_latent_cache_mode).strip().lower()
-        if self.dino_latent_cache_mode not in {"window", "frame"}:
+        if self.dino_latent_cache_mode not in {"window", "frame", "frame_mmap"}:
             raise ValueError(
-                f"`dino_latent_cache_mode` must be 'window' or 'frame', got {dino_latent_cache_mode}"
+                f"`dino_latent_cache_mode` must be 'window', 'frame', or 'frame_mmap', got {dino_latent_cache_mode}"
             )
         self.dino_latent_cache_required = dino_latent_cache_required
+        self._dino_frame_mmap = None
+        self._dino_frame_mmap_path = None
+        self._dino_frame_mmap_np_dtype = None
+        self._dino_frame_mmap_torch_dtype = None
+        self._dino_frame_mmap_shape = None
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -147,6 +153,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def _load_cached_dino_latents(self, idx: int) -> Optional[torch.Tensor]:
         if self.dino_latent_cache_mode == "frame":
             return self._load_cached_dino_frame_latents(idx)
+        if self.dino_latent_cache_mode == "frame_mmap":
+            return self._load_cached_dino_frame_mmap_latents(idx)
 
         cache_path = self._get_dino_latent_cache_path(idx)
         if cache_path is None:
@@ -210,6 +218,88 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if not latents:
             return None
         return torch.stack(latents, dim=1).contiguous()  # [D, T, H, W]
+
+    def _open_dino_frame_mmap(self):
+        if self._dino_frame_mmap is not None:
+            return
+        if self.dino_latent_cache_dir is None or str(self.dino_latent_cache_dir).strip() == "":
+            return
+
+        metadata_path = os.path.join(str(self.dino_latent_cache_dir), "metadata.json")
+        if not os.path.exists(metadata_path):
+            if self.dino_latent_cache_required:
+                raise FileNotFoundError(f"Missing DINO frame mmap metadata: {metadata_path}")
+            return
+
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        if str(metadata.get("cache_mode", "")).strip().lower() != "frame_mmap":
+            raise ValueError(
+                f"DINO mmap cache metadata must have cache_mode='frame_mmap', got "
+                f"{metadata.get('cache_mode')!r} in {metadata_path}"
+            )
+
+        mmap_file = metadata.get("mmap_file", "frames.bin")
+        mmap_path = os.path.join(str(self.dino_latent_cache_dir), str(mmap_file))
+        if not os.path.exists(mmap_path):
+            if self.dino_latent_cache_required:
+                raise FileNotFoundError(f"Missing DINO frame mmap payload: {mmap_path}")
+            return
+
+        total_frames = int(metadata["total_frames"])
+        latent_shape = tuple(int(v) for v in metadata["latent_shape"])
+        save_dtype = str(metadata.get("save_dtype", "bf16")).strip().lower()
+        storage_dtype = str(metadata.get("storage_dtype", "")).strip().lower()
+        if save_dtype in {"bf16", "bfloat16"}:
+            np_dtype = np.uint16
+            torch_dtype = torch.bfloat16
+            if storage_dtype and storage_dtype != "uint16":
+                raise ValueError(f"bf16 mmap cache must use uint16 storage, got {storage_dtype}")
+        elif save_dtype in {"fp16", "float16"}:
+            np_dtype = np.float16
+            torch_dtype = torch.float16
+        elif save_dtype in {"fp32", "float32"}:
+            np_dtype = np.float32
+            torch_dtype = torch.float32
+        else:
+            raise ValueError(f"Unsupported DINO mmap save_dtype={save_dtype!r} in {metadata_path}")
+
+        self._dino_frame_mmap_path = mmap_path
+        self._dino_frame_mmap_np_dtype = np_dtype
+        self._dino_frame_mmap_torch_dtype = torch_dtype
+        self._dino_frame_mmap_shape = (total_frames, *latent_shape)
+        self._dino_frame_mmap = np.memmap(
+            mmap_path,
+            mode="r",
+            dtype=np_dtype,
+            shape=self._dino_frame_mmap_shape,
+        )
+
+    def _load_cached_dino_frame_mmap_latents(self, idx: int) -> Optional[torch.Tensor]:
+        self._open_dino_frame_mmap()
+        if self._dino_frame_mmap is None:
+            return None
+
+        frame_indices = self._get_video_global_indices(idx)
+        total_frames = int(self._dino_frame_mmap_shape[0])
+        invalid = [frame_idx for frame_idx in frame_indices if frame_idx < 0 or frame_idx >= total_frames]
+        if invalid:
+            raise IndexError(
+                f"DINO frame mmap index out of bounds for dataset idx={idx}: "
+                f"indices={invalid[:3]}, total_frames={total_frames}"
+            )
+
+        latent_np = np.asarray(self._dino_frame_mmap[frame_indices])
+        if self._dino_frame_mmap_torch_dtype is torch.bfloat16:
+            latent = torch.from_numpy(np.array(latent_np, copy=True)).view(torch.bfloat16)
+        else:
+            latent = torch.from_numpy(np.array(latent_np, copy=True)).to(dtype=self._dino_frame_mmap_torch_dtype)
+        if latent.ndim != 4:
+            raise ValueError(
+                f"DINO frame mmap slice must be [T,D,H,W], got {tuple(latent.shape)} "
+                f"from {self._dino_frame_mmap_path}"
+            )
+        return latent.permute(1, 0, 2, 3).contiguous()  # [D, T, H, W]
 
     def _get(self, idx):
         sample_idx = idx

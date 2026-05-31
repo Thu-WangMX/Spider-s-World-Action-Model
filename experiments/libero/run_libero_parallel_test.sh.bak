@@ -1,7 +1,5 @@
 #!/bin/bash
-LIBERO_ROOT=${LIBERO_ROOT:-/data73/mingxinwang/LIBERO}
-export LIBERO_ROOT
-export PYTHONPATH="${LIBERO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH=/data73/mingxinwang/LIBERO:$PYTHONPATH
 
 # This script runs LIBERO evaluation tasks in parallel.
 # v3: dynamic GPU load management.

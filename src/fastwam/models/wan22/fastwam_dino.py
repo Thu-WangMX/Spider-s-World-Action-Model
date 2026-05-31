@@ -149,9 +149,16 @@ class FastWAM_DINO(nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
         video_dit_init_from_wan: bool = False,
+        video_dit_pretrained_path: Optional[str] = None,
         wan_model_id: str = "Wan-AI/Wan2.2-TI2V-5B",
     ):
         """Create FastWAM_DINO from configuration dicts."""
+        if video_dit_init_from_wan and video_dit_pretrained_path:
+            raise ValueError(
+                "Use only one DinoVideoDiT initialization path: "
+                "`video_dit_init_from_wan=true` for same-shape Wan loading, or "
+                "`video_dit_pretrained_path=...` for preprocessed smallvideo payloads."
+            )
 
         # Build DINO encoder (frozen)
         dino_encoder = DinoVideoEncoder(
@@ -188,10 +195,15 @@ class FastWAM_DINO(nn.Module):
                 "video_attention_mask_mode", "first_frame_causal"
             ),
             use_gradient_checkpointing=video_dit_config.get("use_gradient_checkpointing", True),
+            latent_patch_size=tuple(video_dit_config.get("latent_patch_size", [1, 1, 1])),
+            latent_patch_mode=video_dit_config.get("latent_patch_mode", "flat"),
+            latent_num_views=video_dit_config.get("latent_num_views", 1),
         ).to(device=device, dtype=torch_dtype)
 
         # Optionally initialize DinoVideoDiT from Wan2.2 Video DiT weights
-        if video_dit_init_from_wan:
+        if video_dit_pretrained_path:
+            video_expert.load_preprocessed_backbone(str(video_dit_pretrained_path))
+        elif video_dit_init_from_wan:
             from .helpers.loader import load_wan22_ti2v_5b_components
 
             wan5b_shape = {

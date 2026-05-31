@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-cd /data11/wmx/Spider-s-World-Action-Model
+cd /data73/mingxinwang/Spider-s-World-Action-Model
 
-export PYTHONPATH=/data11/wmx/Spider-s-World-Action-Model/src:/data11/wmx/Spider-s-World-Action-Model
+export PYTHONPATH=/data73/mingxinwang/Spider-s-World-Action-Model/src:/data73/mingxinwang/Spider-s-World-Action-Model
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 export WAIT_FOR_GPUS=1
 export WAIT_GPU_MAX_USED_MB=1000
 export WAIT_GPU_MAX_UTIL=5
 export WAIT_GPU_INTERVAL=60
-export PYTHON=/data11/wmx/miniconda3/envs/fastwam/bin/python3.10
+export PYTHON=/home/wangmx2605/.conda/envs/spiderwam/bin/python3.10
 export OMP_NUM_THREADS=2
 
-CACHE_DIR=./data/dino_latents_cache/libero_dino_s_2cam224_pool1x2_frame_exact
+CACHE_DIR=./data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact
 
 run_cache() {
   local bs="$1"
@@ -27,7 +27,8 @@ run_cache() {
     dino_latent_cache_dir=${CACHE_DIR} \
     +data.train.pretrained_norm_stats=checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json \
     dino_precompute_batch_size=${bs} \
-    dino_precompute_num_workers=8 \
+    dino_precompute_num_workers=24 \
+    model.dino_config.latent_spatial_pool=[1,1] \
     model.dino_config.encode_microbatch_size=${emb} \
     2>&1 | tee -a logs/precompute_dino_frame_latents_FIXED_b${bs}_emb${emb}_$(date +%Y%m%d_%H%M%S).log
 }
@@ -65,7 +66,7 @@ run_train() {
     data.train.dino_latent_cache_mode=frame \
     data.train.dino_latent_cache_required=true \
     model.dino_config.load_backbone=false \
-    model.dino_config.latent_spatial_pool=[1,2] \
+    model.dino_config.latent_spatial_pool=[1,1] \
     model.loss.lambda_video=0.05 \
     model.loss.lambda_action=5.0 \
     learning_rate=5e-5 \
@@ -73,12 +74,12 @@ run_train() {
     gradient_accumulation_steps=${ga} \
     wandb.enabled=true \
     wandb.project=fast-wam \
-    wandb.name=libero_dino_s_smallvideo_framecache_FIXED_lv0.05_la5_bs${bs}ga${ga} \
-    2>&1 | tee -a logs/train_libero_dino_s_smallvideo_framecache_FIXED_bs${bs}ga${ga}_$(date +%Y%m%d_%H%M%S).log
+    wandb.name=libero_dino_s_smallvideo_nopool_framecache_lv0.05_la5_bs${bs}ga${ga} \
+    2>&1 | tee -a logs/train_libero_dino_s_smallvideo_nopool_framecache_bs${bs}ga${ga}_$(date +%Y%m%d_%H%M%S).log
 }
 
 TRAIN_OK=0
-for spec in "8 2" "4 4" "2 8" "1 16"; do
+for spec in "4 4" "2 8" "1 16"; do
   set -- $spec
   run_train "$1" "$2"
   rc=$?

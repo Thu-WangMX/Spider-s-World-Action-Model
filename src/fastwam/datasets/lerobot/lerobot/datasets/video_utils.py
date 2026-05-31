@@ -17,6 +17,7 @@ import glob
 import importlib
 import logging
 import warnings
+from functools import lru_cache
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -29,14 +30,24 @@ from datasets.features.features import register_feature
 from PIL import Image
 
 
+@lru_cache(maxsize=1)
+def _torchcodec_available() -> tuple[bool, str | None]:
+    if not importlib.util.find_spec("torchcodec"):
+        return False, "'torchcodec' is not available"
+    try:
+        from torchcodec.decoders import VideoDecoder  # noqa: F401
+    except Exception as err:
+        return False, f"torchcodec cannot be loaded: {type(err).__name__}: {err}"
+    return True, None
+
+
+@lru_cache(maxsize=1)
 def get_safe_default_codec():
-    if importlib.util.find_spec("torchcodec"):
+    available, reason = _torchcodec_available()
+    if available:
         return "torchcodec"
-    else:
-        logging.warning(
-            "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
-        )
-        return "pyav"
+    logging.warning("%s; falling back to 'pyav' as the default decoder", reason)
+    return "pyav"
 
 
 def decode_video_frames(

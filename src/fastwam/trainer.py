@@ -36,6 +36,9 @@ class Wan22Trainer:
         self.weight_decay = float(cfg.weight_decay)
         self.batch_size = int(cfg.batch_size)
         self.num_workers = int(cfg.num_workers)
+        self.prefetch_factor = int(getattr(cfg, "prefetch_factor", 2))
+        self.persistent_workers = bool(getattr(cfg, "persistent_workers", False))
+        self.pin_memory = bool(getattr(cfg, "pin_memory", torch.cuda.is_available()))
         self.num_epochs = int(cfg.num_epochs)
         max_steps = cfg.max_steps
         self.max_steps = int(max_steps) if max_steps is not None else None
@@ -78,6 +81,9 @@ class Wan22Trainer:
         self._assert_dataset_length_consistent(self.train_dataset, "train_dataset")
         if self.val_dataset is not None:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
+
+        self._weight_checkpoint_loaded_pre_prepare = False
+        self._load_weight_checkpoint_before_prepare()
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
@@ -171,14 +177,20 @@ class Wan22Trainer:
             batch_size=self.batch_size,
             num_processes=self.accelerator.num_processes,
         )
+        loader_kwargs = {
+            "batch_size": self.batch_size,
+            "shuffle": False,
+            "sampler": self.train_sampler,
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "worker_init_fn": worker_init_fn,
+        }
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+            loader_kwargs["persistent_workers"] = self.persistent_workers
         return DataLoader(
             dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            sampler=self.train_sampler,
-            num_workers=self.num_workers,
-            pin_memory=torch.cuda.is_available(),
-            worker_init_fn=worker_init_fn,
+            **loader_kwargs,
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
@@ -262,6 +274,19 @@ class Wan22Trainer:
         eta_m, eta_s = divmod(eta_rem, 60)
         return f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}", steps_per_sec
 
+    def _load_weight_checkpoint_before_prepare(self):
+        resume = self.resume
+        if not resume:
+            return
+        resume_path = Path(str(resume))
+        if resume_path.is_dir():
+            return
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
+        logger.info("Loading weight checkpoint before accelerator.prepare: %s", resume)
+        self.model.load_checkpoint(str(resume_path), optimizer=None)
+        self._weight_checkpoint_loaded_pre_prepare = True
+
     def _resume_or_load_checkpoint(self):
         resume = self.resume
         if not resume:
@@ -273,9 +298,15 @@ class Wan22Trainer:
             return
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
+        if self._weight_checkpoint_loaded_pre_prepare:
+            logger.warning(
+                "Loaded .pt weights only before optimizer/DeepSpeed initialization; "
+                "optimizer/scheduler/step were not restored."
+            )
+            return
         logger.info("Loading weight checkpoint only: %s", resume)
         self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
-        logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
+        logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored.")
 
     def _set_dit_only_train_mode(self):
         # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.

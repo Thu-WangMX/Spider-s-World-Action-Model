@@ -36,7 +36,7 @@ train:
   concat_multi_camera: "horizontal"
   load_text_context: true
   dino_latent_cache_dir: null
-  dino_latent_cache_mode: window
+  dino_latent_cache_mode: window  # window, frame, or frame_mmap
   dino_latent_cache_required: false
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor

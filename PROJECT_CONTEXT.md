@@ -1439,3 +1439,390 @@ python experiments/libero/run_libero_manager.py \
    - 除非只是补曲线点，否则性价比不高。
 
 一句话总结：当前方案已经证明 “DINO future + action” 能跑通并达到约 `93%` overall，但还没追上 FastWAM。下一步最值得尝试的是 no-pooling `[1,1]`，其次是 adapter/更小模型，把问题从“多训一点”转成“表示和模型容量是否匹配”。
+
+## 四十六、2026-05-24 候选方案：DINO 版 DiT Patch Merge
+
+当前 no-pooling DINO 训练很慢，主要原因是 video token 数过大：
+
+- 原 FastWAM 使用 Wan VAE latent：
+  - 输入 9 帧后，VAE 时间压缩到 `T=3`；
+  - 空间 latent 为 `14x28`；
+  - VideoDiT 入口还有 `patch_size=[1,2,2]`，会把每个 `2x2` latent 小块合成 1 个 transformer token；
+  - 最终 video token 数约为 `3 * 7 * 14 = 294`。
+- 当前 no-pooling DINO-S：
+  - DINO latent 为 `T=9, H=14, W=28`；
+  - 每帧 `14*28=392` tokens；
+  - 总 video token 数为 `9 * 14 * 28 = 3528`；
+  - 比原 FastWAM 多约 `12x` video sequence length，attention 代价显著增加。
+
+一个值得考虑的折中方案是：**保留 no-pooling DINO cache，但在 DinoVideoDiT 输入端增加可学习的 DiT patch merge**。
+
+### 核心想法
+
+不要在 DINO cache 阶段做固定平均 pooling，而是在进入 transformer 前做 learnable patch embedding：
+
+```text
+DINO latent per frame: [384, 14, 28]
+2x2 patch merge:       [384, 14, 28] -> [1024, 7, 14]
+tokens per frame:      392 -> 98
+```
+
+等价理解：
+
+```text
+取一个 2x2 DINO patch 小块:
+[384, 2, 2]
+
+拍平成:
+384 * 2 * 2 = 1536
+
+可学习投影:
+Linear(1536, 1024)
+
+输出:
+1 个 1024 维 transformer token
+```
+
+实现上可以用 `Conv3d` 或等价的 patchify + Linear：
+
+```text
+Conv3d(
+  in_channels=384,
+  out_channels=1024,
+  kernel_size=(1, 2, 2),
+  stride=(1, 2, 2),
+)
+```
+
+这和 `latent_spatial_pool=[1,2]` 不同：
+
+- `latent_spatial_pool=[1,2]` 是固定平均池化，无参数，cache 阶段就丢掉一半横向空间 token。
+- DiT patch merge 是可学习投影，在训练中学习如何融合相邻 token。
+- 它可以保留 no-pooling DINO cache，不需要重新算 DINO latents。
+- 代价是模型结构改变，smallvideo-from-Wan 初始化时 input projection / head 需要重新处理或随机初始化。
+
+### 预期收益
+
+- video token 数从 `3528` 降到 `882`：
+
+```text
+9 * 14 * 28 = 3528
+9 * 7 * 14  = 882
+```
+
+- 相比当前 no-pooling，video self-attention 理论代价大幅下降。
+- 相比固定 pooling，可能更好保留小物体、夹爪接触、放置边界等细节，因为 token merge 是可学习的。
+
+### 风险
+
+- 如果 patch merge 太强，仍可能损失 DINO spatial detail。
+- 如果 input/output patch merge/unmerge 设计不对，video prediction loss 的目标空间会变复杂。
+- 如果只在输入端 merge，输出端需要预测 merged token 表示，而不是原始 `[384,14,28]` DINO latent；这会改变 video loss 定义。
+- 如果还想预测原始 no-pooling DINO latent，需要设计可学习 unpatchify head，从 `[1024,7,14]` 还原到 `[384,14,28]`。
+
+### 实验建议
+
+这个方向适合作为 no-pooling 太慢后的第二阶段 ablation：
+
+1. 先跑当前 pure no-pooling `[1,1]`，确认是否比 `[1,2]` 更好。
+2. 如果 no-pooling 有收益但训练太慢，再实现 DINO DiT patch merge。
+3. 优先尝试空间 patch `kernel_size=(1,2,2), stride=(1,2,2)`，让 token 数接近原 FastWAM。
+4. 保留原 no-pooling DINO frame cache，避免重新预计算。
+
+---
+
+## 四十八、2026-05-28 view-aware learnable DINO token merge 已实现
+
+已在 `src/fastwam/models/wan22/dino_video_dit.py` 中加入可选的 learnable DINO token merge，目标是保留 no-pooling DINO cache / target，同时在 VideoDiT 内部减少 token 数。
+
+### 已新增的配置接口
+
+`configs/model/fastwam_dino_s_smallvideo.yaml` 的 `model.video_dit_config` 新增：
+
+```yaml
+latent_patch_size: [1, 1, 1]
+latent_patch_mode: "flat"  # "flat" 或 "view"
+latent_num_views: 1
+```
+
+默认 `[1,1,1] + flat` 等价于原 no-pool 行为，不改变旧实验链路。
+
+新增 task：
+
+```text
+configs/task/libero_dino_s_smallvideo_2cam_224_viewpatch_1x2x2_1e-4.yaml
+configs/task/libero_dino_s_smallvideo_2cam_224_learnpatch_1x1x2_1e-4.yaml
+```
+
+其中推荐优先试 `viewpatch_1x2x2`：
+
+```yaml
+model:
+  video_dit_config:
+    latent_patch_size: [1, 2, 2]
+    latent_patch_mode: "view"
+    latent_num_views: 2
+```
+
+### view-aware 语义
+
+LIBERO 2cam no-pool DINO-S latent 是：
+
+```text
+[B, D, T, H, W] = [B, 384, T, 14, 28]
+```
+
+`latent_patch_mode=view, latent_num_views=2, latent_patch_size=[1,2,2]` 的处理是：
+
+```text
+先按 width 拆成 2 个 view:
+14 x 28 -> 2 x 14 x 14
+
+每个 view 内 learnable 2x2 merge:
+2 x 14 x 14 -> 2 x 7 x 7
+
+tokens per frame:
+392 -> 98
+```
+
+输出 head 仍然 unpatchify 回原始 dense DINO target：
+
+```text
+[B, hidden, T, 2, 7, 7] -> [B, 384, T, 14, 28]
+```
+
+所以 video loss 仍然和 no-pool DINO latent 对齐，不需要重算 DINO cache。
+
+### 实现细节与已修坑
+
+- `patchify()`：
+  - 默认 `[1,1,1]` 走旧 `Linear(dino_dim, hidden_dim)`。
+  - 大 patch 走 `Conv3d(dino_dim, hidden_dim, kernel_size=stride=latent_patch_size)`。
+  - view mode 先把 width 拆成 view，再对每个 view 独立 patchify。
+- `unpatchify()`：
+  - 将 head 输出的 `dino_dim * prod(latent_patch_size)` 还原成原始 DINO latent。
+  - view mode 会把两个 view 沿 width 拼回 `14x28`。
+- token 顺序固定为 time-major：
+
+```text
+b (t v h w) d
+```
+
+这样 `first_frame_causal` mask、first-frame clean timestep、训练 loss 和 eval prefill 都能对齐。
+
+- view mode 添加了 `view_embedding`，提供 view identity。
+- RoPE 在 view mode 中对两个 view 复用各自 view 内的 `H,W` 坐标，并依靠 `view_embedding` 区分相机。
+- 已禁止 `latent_patch_size[0] != 1`。当前 first-frame conditioning / per-token timestep mask 假设每个 video token 只属于单个原始帧，暂不支持 temporal patch merge。
+- 加载 smallvideo Wan 预处理 backbone 时，`input_projection`、`patch_embedding`、`head`、`view_embedding`、`freqs` 都会跳过并保持当前模型随机初始化；Transformer/text/time 层从预处理 payload 加载。
+- 修复过一次报错：
+
+```text
+ValueError: DinoVideoDiT backbone key mismatch ... missing=['view_embedding']
+```
+
+原因是 `view_embedding` 是裸参数名，不是 `view_embedding.xxx`。现在 `backbone_key_set()` 会把 `key == prefix.rstrip(".")` 也正确跳过。
+
+### 已做过的最小验证
+
+```text
+py_compile OK
+Hydra compose OK: [1,2,2] view 2
+Hydra instantiate OK: (1,2,2) view 2
+
+flat:
+  tokens=(B,1176,hidden), tokens_per_frame=392, output=[B,D,T,14,28]
+
+flat_merge_1x1x2:
+  tokens=(B,588,hidden), tokens_per_frame=196, output=[B,D,T,14,28]
+
+view_merge_1x2x2:
+  tokens=(B,294,hidden), tokens_per_frame=98, output=[B,D,T,14,28]
+
+view_prefill_T1:
+  tokens=(B,98,hidden), tokens_per_frame=98, output=[B,D,1,14,28]
+
+FastWAM_DINO.training_loss OK
+```
+
+### checkpoint / resume 注意事项
+
+旧 no-pool checkpoint 不能直接用 viewpatch config 做完整 resume / eval。原因是 `input_projection`、`patch_embedding`、`head`、`view_embedding` 的 shape / key 不同，PyTorch 即使 `strict=False` 也会对同名 shape mismatch 报错。
+
+正确用法：
+
+- 评测旧 no-pool ckpt：继续用 `task=libero_dino_s_smallvideo_2cam_224_1e-4`。
+- 训练 / 评测新 viewpatch ckpt：用 `task=libero_dino_s_smallvideo_2cam_224_viewpatch_1x2x2_1e-4`。
+- viewpatch 新实验应从 smallvideo Wan 预处理 backbone 初始化，而不是从旧 no-pool `.pt` 权重恢复。
+- smallvideo 的 Wan 初始化不是 `model.video_dit_init_from_wan=true`，而是：
+
+```text
+model.video_dit_init_from_wan=false
+model.video_dit_pretrained_path=checkpoints/DinoVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt
+```
+
+这两个路径不能同时开。`video_dit_init_from_wan=true` 走原 Wan2.2-5B shape，smallvideo hidden_dim=1024 会不匹配。
+
+### 当前 viewpatch 训练命令
+
+8卡，ZeRO1，LIBERO 2cam no-pool frame cache，view-aware `[1,2,2]` merge，从 smallvideo Wan 预处理 backbone 初始化：
+
+```bash
+cd /data73/mingxinwang/Spider-s-World-Action-Model
+source /data73/envs/miniconda3/etc/profile.d/conda.sh
+conda activate spiderwam
+
+export PYTHON=/home/wangmx2605/.conda/envs/spiderwam/bin/python3.10
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export WAIT_FOR_GPUS=0
+export MASTER_PORT=29551
+export MPLCONFIGDIR=/tmp/matplotlib-cache
+
+RUN_ID=viewpatch_1x2x2_waninit_bs16_ga1_10ep_$(date +%Y-%m-%d_%H-%M-%S) \
+bash scripts/train_zero1.sh 8 \
+  task=libero_dino_s_smallvideo_2cam_224_viewpatch_1x2x2_1e-4 \
+  batch_size=16 \
+  gradient_accumulation_steps=1 \
+  num_workers=2 \
+  learning_rate=1e-4 \
+  save_every=2000 \
+  eval_every=200 \
+  wandb.enabled=true \
+  wandb.name=libero_dino_s_viewpatch_1x2x2_waninit_bs16_ga1_10ep \
+  data.train.dino_latent_cache_dir=./data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact \
+  data.train.dino_latent_cache_mode=frame \
+  data.train.dino_latent_cache_required=true \
+  model.dino_config.load_backbone=false \
+  'model.dino_config.latent_spatial_pool=[1,1]' \
+  model.dino_config.encode_microbatch_size=16 \
+  model.video_dit_init_from_wan=false \
+  model.video_dit_pretrained_path=checkpoints/DinoVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt \
+  model.loss.lambda_video=0.05 \
+  model.loss.lambda_action=5.0
+```
+
+### batch size 观察
+
+`batch_size=28, gradient_accumulation_steps=1` 已能跑，但每卡显存约：
+
+```text
+76080 / 81920 MiB
+```
+
+日志早期速度大约：
+
+```text
+speed=0.08 step/s, 17.2~17.8 samples/s
+eta≈43~45h
+```
+
+虽然 batch 变大后每个 epoch 的 step 数减少，但单 step 变慢，整体 ETA 反而可能比 `batch_size=16` 更差。当前判断：
+
+- 最稳：`batch_size=16`
+- 可试：`batch_size=20` 或 `24`
+- 不太推荐继续增大：`batch_size=28`，显存太满且 ETA 未必更好
+
+后续比较 batch 时不要只看 `step/s`，要同时看：
+
+```text
+samples/s
+完整 10 epoch ETA
+显存余量
+val_loss / eval result
+```
+
+---
+
+## 四十九、2026-05-29 viewpatch 训练 batch_size / num_workers 实测
+
+任务：
+
+```text
+libero_dino_s_smallvideo_2cam_224_viewpatch_1x2x2_1e-4
+```
+
+当前 DataLoader 链路仍有 `torchcodec` 加载失败并 fallback 到 `torchvision/pyav` 的 warning，多 worker 并发过高时容易出现：
+
+```text
+RuntimeError: DataLoader worker (...) is killed by signal: Killed.
+```
+
+已实测组合：
+
+```text
+batch_size=24, num_workers=4 -> 报错；两次在 step≈70/150 左右 DataLoader worker killed
+batch_size=24, num_workers=2 -> 可跑，但 ETA≈40h
+batch_size=16, num_workers=2 -> 可跑，但 ETA≈38h
+batch_size=16, num_workers=4 -> 当前最优；ETA≈24h，GPU util≈100%，显存≈48.5GB/卡
+```
+
+当前建议：
+
+- 过夜训练优先用 `batch_size=16, num_workers=4`。
+- 暂时不要再用 `batch_size=24, num_workers=4`。
+- `num_workers>4` 收益预计不大，因为 `batch_size=16, num_workers=4` 已基本喂满 GPU；但 DataLoader worker 被 kill 的风险会增加。
+- 如果 `batch_size=16, num_workers=4` 能稳定跑过 `step=500/1000`，就不要再频繁改 worker。
+
+补充：后续 `batch_size=16, num_workers=4` 也在更晚 step 触发过 DataLoader worker killed；`num_workers=3` 也不稳。更稳的临时组合是：
+
+```text
+batch_size=16, num_workers=2, prefetch_factor=1, persistent_workers=true
+```
+
+---
+
+## 五十、2026-05-29 DINO frame cache 小文件问题与 frame_mmap
+
+当前 `frame` cache：
+
+```text
+data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact
+```
+
+规模：
+
+```text
+277713 个 frames/*.pt
+约 79G
+单帧 latent: [384,14,28] bf16, 约 0.287 MiB
+每个训练 sample 读取 9 帧
+```
+
+多卡多 worker 下，小文件 `torch.load` 数量会被放大：
+
+```text
+8 ranks * batch_size * 9 frame files * num_workers * prefetch_factor
+```
+
+这会和 pyav 视频解码一起造成 DataLoader worker killed。已新增 `frame_mmap` cache 模式：把所有 frame latent 打包成一个连续二进制文件，训练 worker 用 `np.memmap` 按 frame index 取 9 帧，避免 27 万小文件并发读取。
+
+新增脚本：
+
+```bash
+cd /data73/mingxinwang/Spider-s-World-Action-Model
+source /data73/envs/miniconda3/etc/profile.d/conda.sh
+conda activate spiderwam
+
+python scripts/convert_dino_frame_cache_to_mmap.py \
+  --src ./data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact \
+  --dst ./data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact_mmap
+```
+
+转换完成后训练改用：
+
+```bash
+data.train.dino_latent_cache_dir=./data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact_mmap \
+data.train.dino_latent_cache_mode=frame_mmap \
+data.train.dino_latent_cache_required=true \
+num_workers=4 \
+prefetch_factor=1 \
+persistent_workers=true
+```
+
+已做检查：
+
+```text
+frame -> frame_mmap 小样本转换成功
+读取 shape: [384,9,14,28]
+dtype: bf16
+与原 frame cache 逐元素 exact_equal=True
+```
