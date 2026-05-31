@@ -249,7 +249,7 @@ flowchart TD
 
 ---
 
-## 7. LDA-1B DINO Token Dynamics 路线
+## 7. LDA-1B DINO Token Dynamics 路线（类似我们的no-pooling）
 
 LDA-1B 的核心更接近：
 
