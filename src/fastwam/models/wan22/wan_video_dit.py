@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import os
+from pathlib import Path
 from typing import Any, Dict, Tuple, Optional
 from einops import rearrange
 from .helpers.gradient import gradient_checkpoint_forward
@@ -398,6 +400,83 @@ class WanVideoDiT(torch.nn.Module):
         if self.use_gradient_checkpointing:
             logger.info("Using gradient checkpointing for DiT blocks. This will save memory but use more computation.")
             
+    def load_preprocessed_weights(self, video_dit_pretrained_path: str) -> None:
+        """Load a preprocessed WanVideoDiT payload.
+
+        The payload is produced by ``scripts/preprocess_wan_video_dit_small.py``.
+        It initializes a small WanVideoDiT from an interpolated Wan2.2 DiT
+        state dict, including VAE patch embedding/head weights.
+        """
+        p = Path(video_dit_pretrained_path)
+        if not p.is_absolute():
+            p = Path(__file__).resolve().parents[4] / p
+        if not os.path.isfile(p):
+            raise FileNotFoundError(f"`video_dit_pretrained_path` does not exist: {p}")
+
+        payload = torch.load(str(p), map_location="cpu")
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid WanVideoDiT payload type from {p}: {type(payload)}")
+
+        policy = payload.get("policy", {})
+        if policy:
+            logger.info("WanVideoDiT preprocessed payload policy: %s", policy)
+
+        meta = payload.get("meta")
+        if not isinstance(meta, dict):
+            raise ValueError(f"`meta` must be a dict in {p}, got {type(meta)}")
+        expected_meta = {
+            "hidden_dim": int(self.hidden_dim),
+            "in_dim": int(self.in_dim),
+            "out_dim": int(self.head.head.out_features // math.prod(self.patch_size)),
+            "ffn_dim": int(self.blocks[0].ffn[0].out_features) if len(self.blocks) else None,
+            "num_layers": int(len(self.blocks)),
+            "num_heads": int(self.num_heads),
+            "attn_head_dim": int(self.attn_head_dim),
+            "text_dim": int(self.text_embedding[0].in_features),
+            "freq_dim": int(self.freq_dim),
+            "patch_size": tuple(int(x) for x in self.patch_size),
+        }
+        for key, expected in expected_meta.items():
+            if key not in meta:
+                raise ValueError(f"`meta.{key}` missing in {p}")
+            got = meta[key]
+            if key == "patch_size":
+                got_value = tuple(int(x) for x in got)
+                if got_value != expected:
+                    raise ValueError(f"`meta.{key}` mismatch in {p}: expected {expected}, got {got_value}")
+            elif expected is not None and int(got) != int(expected):
+                raise ValueError(f"`meta.{key}` mismatch in {p}: expected {expected}, got {got}")
+
+        state_dict = payload.get("state_dict")
+        if not isinstance(state_dict, dict):
+            raise ValueError(f"`state_dict` must be a dict in {p}, got {type(state_dict)}")
+
+        own_state = self.state_dict()
+        provided_keys = set(state_dict.keys())
+        expected_keys = set(own_state.keys())
+        missing_keys = sorted(expected_keys - provided_keys)
+        unexpected_keys = sorted(provided_keys - expected_keys)
+        if missing_keys or unexpected_keys:
+            raise ValueError(
+                "WanVideoDiT key mismatch in preprocessed payload. "
+                f"missing={missing_keys[:10]}{'...' if len(missing_keys) > 10 else ''}, "
+                f"unexpected={unexpected_keys[:10]}{'...' if len(unexpected_keys) > 10 else ''}"
+            )
+
+        merged_state = dict(own_state)
+        for key in sorted(expected_keys):
+            value = state_dict[key]
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"`state_dict[{key}]` must be torch.Tensor in {p}, got {type(value)}")
+            target = merged_state[key]
+            if tuple(value.shape) != tuple(target.shape):
+                raise ValueError(
+                    f"Shape mismatch for `{key}` in {p}: expected {tuple(target.shape)}, got {tuple(value.shape)}"
+                )
+            merged_state[key] = value.to(device=target.device, dtype=target.dtype)
+
+        self.load_state_dict(merged_state, strict=True)
+        logger.info("Loaded preprocessed WanVideoDiT weights from %s (keys=%d).", p, len(expected_keys))
 
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
         x = self.patch_embedding(x)

@@ -101,6 +101,7 @@ class FastWAM(torch.nn.Module):
         video_dit_config: dict[str, Any] | None = None,
         action_dit_config: dict[str, Any] | None = None,
         action_dit_pretrained_path: str | None = None,
+        video_dit_pretrained_path: str | None = None,
         skip_dit_load_from_pretrain: bool = False,
         mot_checkpoint_mixed_attn: bool = True,
         video_train_shift: float = 5.0,
@@ -125,11 +126,13 @@ class FastWAM(torch.nn.Module):
             tokenizer_max_len=tokenizer_max_len,
             redirect_common_files=redirect_common_files,
             dit_config=video_dit_config,
-            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            skip_dit_load_from_pretrain=(skip_dit_load_from_pretrain or bool(video_dit_pretrained_path)),
             load_text_encoder=load_text_encoder,
         )
 
         video_expert = components.dit
+        if video_dit_pretrained_path:
+            video_expert.load_preprocessed_weights(str(video_dit_pretrained_path))
         action_expert = ActionDiT.from_pretrained(
             action_dit_config=action_dit_config,
             action_dit_pretrained_path=action_dit_pretrained_path,
@@ -171,6 +174,7 @@ class FastWAM(torch.nn.Module):
         )
         model.model_paths = {
             "video_dit": components.dit_path,
+            "video_dit_preprocessed": video_dit_pretrained_path,
             "vae": components.vae_path,
             "text_encoder": components.text_encoder_path,
             "tokenizer": components.tokenizer_path,

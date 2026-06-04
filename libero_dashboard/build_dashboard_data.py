@@ -19,6 +19,67 @@ SUITES = ["libero_spatial", "libero_object", "libero_goal", "libero_10"]
 
 MANUAL_NOTES: list[tuple[str, dict[str, Any]]] = [
     (
+        "viewpatch_1x1x2_lr2e-5_30trials_step_020000",
+        {
+            "valid": True,
+            "resume_type": "weight-only resume from viewpatch_1x1x2_mmap_bs12_w6_30trials_step_024000",
+            "learning_rate": "2e-5 constant",
+            "global_batch": 96,
+            "pooling": "view-aware patch merge [1,1,2]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S small-video",
+            "wan_init": "false",
+            "variant": "viewpatch [1,1,2], weight-only from step024000, lr2e-5, eval step020000",
+        },
+    ),
+    (
+        "viewpatch_1x1x2_weightinit_step024000_30trials_step_012000",
+        {
+            "valid": True,
+            "warning": "unexpectedly low eval; logs confirm checkpoint step_012000 was loaded",
+            "resume_type": "weight-only restart from viewpatch [1,1,2] step024000; later full-state resume from step009500",
+            "learning_rate": "1e-4 cosine restart",
+            "global_batch": 96,
+            "pooling": "view-aware patch merge [1,1,2]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S small-video",
+            "wan_init": "false",
+            "variant": "viewpatch [1,1,2], weight-init step024000, eval step012000",
+        },
+    ),
+    (
+        "viewpatch_1x1x2_weightinit_step024000_30trials_step_016000",
+        {
+            "valid": True,
+            "resume_type": "weight-only restart from viewpatch [1,1,2] step024000; later full-state resume from step009500",
+            "learning_rate": "1e-4 cosine restart",
+            "global_batch": 96,
+            "pooling": "view-aware patch merge [1,1,2]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S small-video",
+            "wan_init": "false",
+            "variant": "viewpatch [1,1,2], weight-init step024000, eval step016000",
+        },
+    ),
+    (
+        "viewpatch_1x1x2_mmap_bs12_w6_30trials_step_024000",
+        {
+            "valid": True,
+            "resume_type": "fresh viewpatch train",
+            "learning_rate": "1e-4",
+            "global_batch": 96,
+            "pooling": "view-aware patch merge [1,1,2]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S small-video",
+            "wan_init": "false",
+            "variant": "viewpatch [1,1,2], mmap cache, step024000",
+        },
+    ),
+    (
         "viewpatch_1x2x2_weightonly_from_step032000_lr2e-5_30trials_step_008000",
         {
             "valid": True,

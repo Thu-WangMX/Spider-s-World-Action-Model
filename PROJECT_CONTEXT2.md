@@ -1,6 +1,6 @@
 # SpiderWAM 最新实验上下文
 
-更新时间：2026-05-29
+更新时间：2026-06-03
 
 这个文件从 2026-05-29 开始记录最新关键状态。后续新的训练、评测、修 bug 和结论优先追加到这里，旧的长上下文仍保留在 `PROJECT_CONTEXT.md`。
 
@@ -697,4 +697,356 @@ bash scripts/train_zero1.sh 8 \
   model.video_dit_pretrained_path=checkpoints/DinoVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt \
   model.loss.lambda_video=0.05 \
   model.loss.lambda_action=5.0
+```
+
+---
+
+## 12. 2026-06-03 新增 VAE smallvideo baseline
+
+### 动机
+
+当前 DINO 线主要使用 smallvideo 级别的 VideoDiT：
+
+```text
+hidden_dim=1024
+ffn_dim=4096
+num_layers=30
+num_heads=24
+attn_head_dim=128
+```
+
+而原始 FastWAM/Wan VAE 线默认使用 5B 形状：
+
+```text
+hidden_dim=3072
+ffn_dim=14336
+num_layers=30
+num_heads=24
+attn_head_dim=128
+```
+
+因此直接比较原始 VAE FastWAM 和 DINO smallvideo 不公平：差异同时包含 latent 表征和 VideoDiT 容量。新增 VAE smallvideo baseline 的目标是：
+
+```text
+同一 small VideoDiT 容量下，对比 VAE latent vs DINO token。
+```
+
+### 已新增文件
+
+```text
+scripts/preprocess_wan_video_dit_small.py
+configs/model/fastwam_smallvideo.yaml
+configs/task/libero_vae_smallvideo_2cam224_1e-4.yaml
+/data73/mingxinwang/Spider-s-World-Action-Model/scripts/interpolate_wan_video_dit_small.sh
+```
+
+并修改：
+
+```text
+src/fastwam/models/wan22/wan_video_dit.py
+src/fastwam/models/wan22/fastwam.py
+src/fastwam/runtime.py
+```
+
+新增能力：
+
+1. `WanVideoDiT.load_preprocessed_weights(video_dit_pretrained_path)`  
+   允许 VAE VideoDiT 从预处理后的 small WanVideoDiT payload 加载。
+
+2. `FastWAM.from_wan22_pretrained(..., video_dit_pretrained_path=...)`  
+   当提供 `video_dit_pretrained_path` 时，先构造目标 small-shape WanVideoDiT，再加载预处理权重；不会把 5B 权重直接硬塞进 small shape。
+
+3. `runtime.create_fastwam/create_fastwam_joint` 已透传 `video_dit_pretrained_path`。
+
+### VAE smallvideo 目标结构
+
+VAE smallvideo 保持 Wan VAE latent 输入输出：
+
+```text
+in_dim=48
+out_dim=48
+patch_size=[1,2,2]
+```
+
+同时把 VideoDiT backbone 缩到和 DINO smallvideo / ActionDiT 一致：
+
+```text
+hidden_dim=1024
+ffn_dim=4096
+num_layers=30
+num_heads=24
+attn_head_dim=128
+text_dim=4096
+freq_dim=256
+```
+
+也就是说：
+
+```text
+VAE latent + small WanVideoDiT + same ActionDiT shape
+```
+
+不是原始 5B FastWAM。
+
+### 初始化方式
+
+目标权重文件：
+
+```text
+checkpoints/WanVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt
+```
+
+生成方式：
+
+```text
+Wan2.2-5B WanVideoDiT
+-> sequential 1D linear interpolation
+-> alpha scaling
+-> target small WanVideoDiT full state_dict
+```
+
+这个 payload 包含完整 VAE VideoDiT 权重：
+
+```text
+patch_embedding.*
+blocks.*
+text_embedding.*
+time_embedding.*
+time_projection.*
+head.*
+```
+
+不同于 DINO payload 只迁移 backbone、保留 DINO-specific input/output projection/head 随机。
+
+### 生成 VAE smallvideo 初始化权重
+
+当前 2026-06-03 检查时，8 张 GPU 正在跑：
+
+```text
+viewpatch_1x1x2_mmap_bs12_w6_weightonly_from_step024000_lr2e-5_5ep_2026-06-02_night
+```
+
+每张卡约占 60G，因此没有立即生成 VAE smallvideo payload。等训练结束或有空卡后运行：
+
+```bash
+cd /data73/mingxinwang/Spider-s-World-Action-Model
+bash scripts/interpolate_wan_video_dit_small.sh
+```
+
+脚本内容等价于：
+
+```bash
+cd /data73/mingxinwang/Spider-s-World-Action-Model
+source /data73/envs/miniconda3/etc/profile.d/conda.sh
+conda activate spiderwam
+
+export PYTHON=/home/wangmx2605/.conda/envs/spiderwam/bin/python3.10
+export DIFFSYNTH_MODEL_BASE_PATH=/data73/mingxinwang/Spider-s-World-Action-Model/checkpoints
+export CUDA_VISIBLE_DEVICES=0
+export MPLCONFIGDIR=/tmp/matplotlib-cache
+
+$PYTHON scripts/preprocess_wan_video_dit_small.py \
+  --model-config configs/model/fastwam_smallvideo.yaml \
+  --output checkpoints/WanVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt \
+  --device cuda \
+  --dtype bfloat16 \
+  --apply-alpha-scaling true
+```
+
+### VAE smallvideo 训练命令
+
+生成 `checkpoints/WanVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt` 后，可用：
+
+```bash
+cd /data73/mingxinwang/Spider-s-World-Action-Model
+source /data73/envs/miniconda3/etc/profile.d/conda.sh
+conda activate spiderwam
+
+export PYTHON=/home/wangmx2605/.conda/envs/spiderwam/bin/python3.10
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export WAIT_FOR_GPUS=0
+export MASTER_PORT=29564
+export MPLCONFIGDIR=/tmp/matplotlib-cache
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+RUN_ID=vae_smallvideo_bs16_10ep_$(date +%Y-%m-%d_%H-%M-%S)
+bash scripts/train_zero1.sh 8 \
+  task=libero_vae_smallvideo_2cam224_1e-4 \
+  output_dir=./runs/libero_vae_smallvideo_2cam224_1e-4/${RUN_ID} \
+  batch_size=16 \
+  gradient_accumulation_steps=1 \
+  num_workers=8 \
+  prefetch_factor=1 \
+  persistent_workers=true \
+  learning_rate=1e-4 \
+  lr_scheduler_type=cosine \
+  num_epochs=10 \
+  save_every=2000 \
+  eval_every=200 \
+  wandb.enabled=true \
+  wandb.name=libero_vae_smallvideo_bs16_10ep
+```
+
+### 与 DINO smallvideo / ActionDiT 初始化的关系
+
+当前确认：
+
+```text
+ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+DinoVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt
+```
+
+二者都是从 Wan2.2-5B 同源插值到 small shape，key 集合和 shape 一致：
+
+```text
+common keys = 820
+action-only = 0
+dino-only = 0
+shape_diff = 0
+```
+
+但不保证逐元素完全相同。代码级原因是 ActionDiT 脚本和 DinoVideoDiT 脚本的 `alpha scaling` 与 `bf16 cast` 顺序不同：
+
+```text
+ActionDiT:
+fp32 interpolate -> cast bf16 -> fp32 alpha scaling -> cast bf16 save
+
+DinoVideoDiT:
+fp32 interpolate -> fp32 alpha scaling -> cast bf16 save
+```
+
+这种差异是 bf16 rounding 级别，理论上对训练影响很小。后续 VAE smallvideo 应按 DINO 脚本更干净的顺序：
+
+```text
+fp32 interpolate -> fp32 alpha scaling -> final bf16 cast
+```
+
+### 实验解释口径
+
+VAE smallvideo baseline 应表述为：
+
+```text
+VAE latent supervision under the same small VideoDiT capacity as DINO-small.
+```
+
+而不是原始 FastWAM 5B baseline。
+
+如果结果：
+
+1. VAE smallvideo 明显低于 DINO avg/no-pool  
+   说明 DINO token 表征在同等 small backbone 容量下更有利于 action learning。
+
+2. VAE smallvideo 接近 DINO  
+   说明之前 DINO/VAE 差距可能主要来自容量、训练步数或具体 loss/token 设计，而不是 latent 类型本身。
+
+3. VAE smallvideo 高于 DINO  
+   说明 DINO 路线并不天然优于 VAE，需要重新考虑 DINO token dynamics 的训练目标和使用方式。
+
+### 2026-06-03 VAE smallvideo 代码排查结论
+
+新增 guard 脚本：
+
+```bash
+/data73/mingxinwang/run_vae_smallvideo_2cam224_10ep_with_guard.sh
+```
+
+今晚正确顺序：
+
+```bash
+# 1. 先生成 VAE-small VideoDiT 初始化 payload
+cd /data73/mingxinwang/Spider-s-World-Action-Model
+bash scripts/interpolate_wan_video_dit_small.sh
+
+# 2. 确认生成成功
+ls -lh /data73/mingxinwang/Spider-s-World-Action-Model/checkpoints/WanVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt
+
+# 3. 再开训
+bash /data73/mingxinwang/run_vae_smallvideo_2cam224_10ep_with_guard.sh
+```
+
+guard 脚本会在启动训练前检查：
+
+```text
+checkpoints/WanVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt
+checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+```
+
+如果 VAE-small video init payload 不存在，它会直接退出并提示先跑 preprocess，不会误开一个坏训练。
+
+已经做过的校验：
+
+```text
+py_compile: OK
+WanVideoDiT.load_preprocessed_weights strict loader roundtrip: OK
+Hydra train compose: OK
+Hydra sim_libero eval compose: OK
+```
+
+Hydra compose 关键结果：
+
+```text
+训练 task=libero_vae_smallvideo_2cam224_1e-4:
+  model.load_text_encoder = false
+  video hidden/ffn/layers = 1024 / 4096 / 30
+  batch_size / num_epochs / lr = 16 / 10 / 1e-4
+  save_every / eval_every = 2000 / 200
+
+LIBERO rollout eval:
+  base config = sim_libero.yaml
+  model.load_text_encoder = true
+  model.skip_dit_load_from_pretrain = true
+  model.action_dit_pretrained_path = null
+```
+
+这个覆盖关系是合理的：
+
+1. 训练时数据集提供 cached `context/context_mask`，不需要 text encoder，可以省显存。
+2. 外部 LIBERO rollout eval 会传 prompt 字符串，所以 `sim_libero.yaml` 会把 `model.load_text_encoder=true` 打开。
+3. eval 时 `skip_dit_load_from_pretrain=true` 和 `action_dit_pretrained_path=null` 不影响最终权重，因为模型实例化后马上会 `model.load_checkpoint(ckpt)` 加载训练 checkpoint。
+4. 但 eval 仍然需要 `WanVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt` 存在，因为当前 `FastWAM.from_wan22_pretrained()` 会先用它构造同 shape 的 video expert，再加载训练 checkpoint。
+
+训练中 eval 路径：
+
+```text
+Wan22Trainer.evaluate()
+  -> model.training_loss(sample)
+  -> model.infer_action(context/context_mask=sample context)
+```
+
+因此训练中 eval 不依赖 text encoder，和训练 batch 的 text embedding 来源一致。
+
+外部 rollout eval 路径：
+
+```text
+experiments/libero/run_libero_manager.py
+  -> sim_libero.yaml + task override
+  -> eval_libero_single.py
+  -> instantiate(cfg.model, load_text_encoder=true)
+  -> model.load_checkpoint(ckpt)
+  -> model.infer_action(prompt=DEFAULT_PROMPT.format(task=...))
+```
+
+VAE smallvideo eval 命令模板：
+
+```bash
+cd /data73/mingxinwang/Spider-s-World-Action-Model
+source /data73/envs/miniconda3/etc/profile.d/conda.sh
+conda activate spiderwam
+
+export PYTHON=/home/wangmx2605/.conda/envs/spiderwam/bin/python3.10
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export WAIT_FOR_GPUS=0
+export MPLCONFIGDIR=/tmp/matplotlib-cache
+
+RUN_DIR=/data73/mingxinwang/Spider-s-World-Action-Model/runs/libero_vae_smallvideo_2cam224_1e-4/YOUR_RUN_DIR
+LATEST_CKPT=$(ls -1 "$RUN_DIR"/checkpoints/weights/step_*.pt | sort -V | tail -n 1)
+
+$PYTHON experiments/libero/run_libero_manager.py \
+  task=libero_vae_smallvideo_2cam224_1e-4 \
+  ckpt="$LATEST_CKPT" \
+  EVALUATION.num_trials=30 \
+  EVALUATION.dataset_stats_path="$RUN_DIR/dataset_stats.json" \
+  EVALUATION.output_dir="./evaluate_results/libero/vae_smallvideo_30trials_$(basename "$LATEST_CKPT" .pt)" \
+  MULTIRUN.num_gpus=8 \
+  MULTIRUN.max_tasks_per_gpu=4
 ```

@@ -501,7 +501,10 @@
     }
 
     function signatureOf(data) {
-      return (data.evals || []).map(e => `${e.id}:${e.mtime}:${e.overall}`).join("|") + `::${data.training_state?.latest_weight || ""}`;
+      return (data.evals || []).map(e => {
+        const meta = e.meta || {};
+        return `${e.id}:${e.mtime}:${e.overall}:${meta.resume_type || ""}:${meta.variant || ""}:${meta.warning || ""}`;
+      }).join("|") + `::${data.training_state?.latest_weight || ""}`;
     }
 
     async function loadData(options = {}) {
@@ -566,10 +569,12 @@
           : `<span class="badge valid">valid</span>`;
         const trials = e.suites.libero_spatial?.trials ?? e.suites.libero_10?.trials ?? "-";
         const warn = e.meta.warning ? `<div class="detail">${e.meta.warning}</div>` : "";
+        const variant = e.meta.variant && e.meta.variant !== "unknown" ? `<div class="detail">${e.meta.variant}</div>` : "";
+        const resume = e.meta.resume_type && e.meta.resume_type !== "unknown" ? `<div class="detail">resume: ${e.meta.resume_type}</div>` : "";
         return `<tr>
           <td title="${e.mtime_text || ""}">${e.eval_date || "-"}</td>
           <td>${status}</td>
-          <td><strong>${e.id}</strong>${warn}</td>
+          <td><strong>${e.id}</strong>${variant}${resume}${warn}</td>
           <td>${e.step ?? "-"}</td>
           ${["libero_spatial", "libero_object", "libero_goal", "libero_10"].map(s => `<td class="${clsScore(e.suites[s]?.score)}">${pct(e.suites[s]?.score)}</td>`).join("")}
           <td class="${clsScore(e.overall)}">${pct(e.overall)}</td>
