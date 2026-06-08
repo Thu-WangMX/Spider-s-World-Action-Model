@@ -1050,3 +1050,177 @@ $PYTHON experiments/libero/run_libero_manager.py \
   MULTIRUN.num_gpus=8 \
   MULTIRUN.max_tasks_per_gpu=4
 ```
+
+### 2026-06-04 VAE smallvideo step014000 full-resume + eval 脚本
+
+新增保护脚本：
+
+```bash
+/data73/mingxinwang/run_vae_smallvideo_resume_step014000_eval_then_occupy.sh
+```
+
+用途：
+
+1. 从
+   `/data73/mingxinwang/Spider-s-World-Action-Model/runs/libero_vae_smallvideo_2cam224_1e-4/vae_smallvideo_bs16_10ep_2026-06-03_15-02-12/checkpoints/state/step_014000`
+   做 full resume。
+2. 输出到新的 run dir：
+   `runs/libero_vae_smallvideo_2cam224_1e-4/vae_smallvideo_fullresume_step014000_to20ep_*`
+   ，不覆盖原始 run。
+3. 保持当前 VAE small 的真实训练设置：
+   `batch_size=32`, `global_batch=256`, `learning_rate=1e-4 cosine`, `num_epochs=20`。
+   full resume 会恢复 optimizer/scheduler/global_step，目标仍然是原 20 epoch 对应的总步数。
+4. 训练正常结束后，自动用最新 `checkpoints/weights/step_*.pt` 跑 30-trials LIBERO eval。
+5. eval 结束后，无论 eval 成功与否，都会按要求启动 `/data73/mingxinwang/test_run.sh` 占卡进程。
+
+运行：
+
+```bash
+bash /data73/mingxinwang/run_vae_smallvideo_resume_step014000_eval_then_occupy.sh
+```
+
+### 2026-06-06 DINO viewpatch [1,2,2] merged-token loss 变体
+
+目的：
+
+对比历史 `viewpatch [1,2,2]` 的 dense loss 是否因为“1 个 merged token 要预测 4 个 dense DINO token”导致目标过难。
+
+新增可选接口：
+
+```text
+model.video_dit_config.output_patch_space=dense   # 默认，旧行为，不影响已有配置
+model.video_dit_config.output_patch_space=merged  # 新行为，merged-token loss
+```
+
+新增任务配置：
+
+```bash
+configs/task/libero_dino_s_smallvideo_2cam_224_viewpatch_1x2x2_mergedloss_1e-4.yaml
+```
+
+这个配置保持输入端不变：
+
+```text
+DINO dense latent: [384, T, 14, 28]
+view-aware Conv3D patch merge: [1,2,2]
+Video DiT tokens: 2 views * 7 * 7 = 98 tokens/frame
+```
+
+区别在输出和监督空间：
+
+```text
+历史 dense loss:
+  head: hidden -> 384 * 4
+  pred:   [384, T, 14, 28]
+  target: [384, T, 14, 28]
+
+新 merged-token loss:
+  head: hidden -> 384
+  pred:   [384, T, 7, 14]
+  target: fixed average over the same [1,2,2] DINO patch group -> [384, T, 7, 14]
+```
+
+因此这个实验只检验 loss space，不改变输入 token 数，也不影响旧 no-pool / avg-pool / dense-viewpatch 配置。
+
+新增 b1/b3 通用保护脚本：
+
+```bash
+/data73/mingxinwang/run_view_dino_1x2x2_mergedloss_10ep_with_guard.sh
+```
+
+如果希望训练异常退出或训练正常结束后都自动启动占卡程序，使用：
+
+```bash
+/data73/mingxinwang/run_view_dino_1x2x2_mergedloss_10ep_then_occupy.sh
+```
+
+默认设置：
+
+```text
+task=libero_dino_s_smallvideo_2cam_224_viewpatch_1x2x2_mergedloss_1e-4
+batch_size=16
+gradient_accumulation_steps=1
+global_bs=128
+num_workers=6
+num_epochs=10
+lr=1e-4 cosine
+lambda_video=0.05
+lambda_action=5.0
+save_every=2000
+eval_every=200
+wandb.enabled=true
+cache=./data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact_mmap
+video init=checkpoints/DinoVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt
+```
+
+注意：脚本默认使用 W&B online mode。新机器需要先执行 `wandb login`，否则会因为 `No API key configured` 中断训练。
+
+这里默认 `lambda_video=0.05` 是为了和之前 `[1,2,2] dense loss` 实验尽量只差一个变量：输出/监督空间。
+如果后续要单独测 video loss 权重，可以用环境变量覆盖：
+
+```bash
+LAMBDA_VIDEO=1.0 bash /data73/mingxinwang/run_view_dino_1x2x2_mergedloss_10ep_with_guard.sh
+```
+
+正常开训命令：
+
+```bash
+bash /data73/mingxinwang/run_view_dino_1x2x2_mergedloss_10ep_with_guard.sh
+```
+
+今晚需要训完也占卡时，用：
+
+```bash
+bash /data73/mingxinwang/run_view_dino_1x2x2_mergedloss_10ep_then_occupy.sh
+```
+
+跑前 dry-run 检查命令，不会真正训练，也不会启动占卡：
+
+```bash
+DRY_RUN=1 WANDB_ENABLED=false RUN_ID=debug_viewpatch_1x2x2_mergedloss_dryrun \
+bash /data73/mingxinwang/run_view_dino_1x2x2_mergedloss_10ep_with_guard.sh
+```
+
+可选覆盖 batch / worker / run id：
+
+```bash
+RUN_ID=viewpatch_1x2x2_mergedloss_mmap_bs16_w6_10ep_b1_$(date +%Y-%m-%d_%H-%M-%S) \
+BATCH_SIZE=16 \
+WORKERS=6 \
+bash /data73/mingxinwang/run_view_dino_1x2x2_mergedloss_10ep_with_guard.sh
+```
+
+已做轻量校验：
+
+```text
+py_compile: OK
+bash -n guard script: OK
+git diff --check: OK
+guard script DRY_RUN=1: OK
+Hydra compose with output_patch_space=merged and lambda_video=0.05: OK
+shape check:
+  tokens = [2, 882, 64]        # 9 frames * 98 tokens/frame
+  pred   = [2, 384, 9, 7, 14]
+  target = [2, 384, 9, 7, 14]
+```
+
+新增回归测试脚本：
+
+```bash
+PYTHONPATH=/data73/mingxinwang/Spider-s-World-Action-Model/src \
+/home/wangmx2605/.conda/envs/spiderwam/bin/python3.10 \
+  scripts/check_dino_merged_loss.py
+```
+
+测试覆盖：
+
+```text
+old no-pool default stays dense: OK
+old [1,2,2] viewpatch still unpatchifies dense: OK
+merged [1,2,2] predicts and supervises compact grid: OK
+training-loss tail and image mask align: OK
+full tiny FastWAM_DINO training_loss/backward works in dense mode: OK
+full tiny FastWAM_DINO training_loss/backward works in merged mode: OK
+Hydra train/eval configs compose with expected old/new behavior: OK
+train-time eval uses training_loss; rollout infer_action does not use video head: OK
+```

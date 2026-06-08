@@ -15,14 +15,139 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "libero_dashboard" / "dashboard_data.json"
 SUITES = ["libero_spatial", "libero_object", "libero_goal", "libero_10"]
+DEFAULT_TRAIN_SAMPLE_COUNT = 277713
 
 
 MANUAL_NOTES: list[tuple[str, dict[str, Any]]] = [
+    (
+        "viewpatch_1x2x2_mergedloss_30trials_step_021700",
+        {
+            "valid": True,
+            "resume_type": "fresh viewpatch train",
+            "learning_rate": "1e-4 cosine",
+            "global_batch": 128,
+            "pooling": "view-aware patch merge [1,2,2], merged-token loss",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S small-video",
+            "wan_init": "false",
+            "variant": "viewpatch [1,2,2], output_patch_space=merged, loss on merged tokens, eval step021700",
+        },
+    ),
+    (
+        "vae_smallvideo_weightonly_from_step021700_lr1e-5_30trials_step_005425",
+        {
+            "valid": True,
+            "resume_type": "weight-only restart from VAE-small full-resume step021700",
+            "resume_base_step": 21700,
+            "learning_rate": "1e-5 cosine restart",
+            "global_batch": 256,
+            "pooling": "Wan VAE latent + Conv3D patchify [1,2,2]",
+            "lambda_video": 1.0,
+            "lambda_action": 1.0,
+            "model": "VAE small-video baseline",
+            "wan_init": "WanVideoDiT small from Wan2.2 interpolation",
+            "variant": "VAE latent, weight-only from step021700, lr1e-5, eval step005425",
+        },
+    ),
+    (
+        "vae_smallvideo_weightonly_from_step021700_lr1e-5_30trials_step_004000",
+        {
+            "valid": True,
+            "resume_type": "weight-only restart from VAE-small full-resume step021700",
+            "resume_base_step": 21700,
+            "learning_rate": "1e-5 cosine restart",
+            "global_batch": 256,
+            "pooling": "Wan VAE latent + Conv3D patchify [1,2,2]",
+            "lambda_video": 1.0,
+            "lambda_action": 1.0,
+            "model": "VAE small-video baseline",
+            "wan_init": "WanVideoDiT small from Wan2.2 interpolation",
+            "variant": "VAE latent, weight-only from step021700, lr1e-5, eval step004000",
+        },
+    ),
+    (
+        "vae_smallvideo_weightonly_from_step021700_lr1e-5_30trials_step_002000",
+        {
+            "valid": True,
+            "resume_type": "weight-only restart from VAE-small full-resume step021700",
+            "resume_base_step": 21700,
+            "learning_rate": "1e-5 cosine restart",
+            "global_batch": 256,
+            "pooling": "Wan VAE latent + Conv3D patchify [1,2,2]",
+            "lambda_video": 1.0,
+            "lambda_action": 1.0,
+            "model": "VAE small-video baseline",
+            "wan_init": "WanVideoDiT small from Wan2.2 interpolation",
+            "variant": "VAE latent, weight-only from step021700, lr1e-5, eval step002000",
+        },
+    ),
+    (
+        "vae_smallvideo_fullresume_step014000_to20ep_30trials_step_021700",
+        {
+            "valid": True,
+            "resume_type": "full-state resume from VAE-small step014000, trained to original 20ep endpoint",
+            "learning_rate": "1e-4 cosine resumed",
+            "global_batch": 256,
+            "pooling": "Wan VAE latent + Conv3D patchify [1,2,2]",
+            "lambda_video": 1.0,
+            "lambda_action": 1.0,
+            "model": "VAE small-video baseline",
+            "wan_init": "WanVideoDiT small from Wan2.2 interpolation",
+            "variant": "VAE latent, small VideoDiT 1024 hidden, full resume step014000 -> step021700",
+        },
+    ),
+    (
+        "vae_smallvideo_fullresume_step014000_to20ep_30trials_step_020000",
+        {
+            "valid": True,
+            "resume_type": "full-state resume from VAE-small step014000",
+            "learning_rate": "1e-4 cosine resumed",
+            "global_batch": 256,
+            "pooling": "Wan VAE latent + Conv3D patchify [1,2,2]",
+            "lambda_video": 1.0,
+            "lambda_action": 1.0,
+            "model": "VAE small-video baseline",
+            "wan_init": "WanVideoDiT small from Wan2.2 interpolation",
+            "variant": "VAE latent, small VideoDiT 1024 hidden, full resume step014000 -> step020000",
+        },
+    ),
+    (
+        "vae_smallvideo_fullresume_step014000_to20ep_30trials_step_018000",
+        {
+            "valid": True,
+            "resume_type": "full-state resume from VAE-small step014000",
+            "learning_rate": "1e-4 cosine resumed",
+            "global_batch": 256,
+            "pooling": "Wan VAE latent + Conv3D patchify [1,2,2]",
+            "lambda_video": 1.0,
+            "lambda_action": 1.0,
+            "model": "VAE small-video baseline",
+            "wan_init": "WanVideoDiT small from Wan2.2 interpolation",
+            "variant": "VAE latent, small VideoDiT 1024 hidden, full resume step014000 -> step018000",
+        },
+    ),
+    (
+        "vae_smallvideo_30trials_step_014000",
+        {
+            "valid": True,
+            "resume_type": "fresh VAE-small train, eval step014000",
+            "learning_rate": "1e-4 cosine",
+            "global_batch": 256,
+            "pooling": "Wan VAE latent + Conv3D patchify [1,2,2]",
+            "lambda_video": 1.0,
+            "lambda_action": 1.0,
+            "model": "VAE small-video baseline",
+            "wan_init": "WanVideoDiT small from Wan2.2 interpolation",
+            "variant": "VAE latent, small VideoDiT 1024 hidden, base FastWAM first-frame action eval",
+        },
+    ),
     (
         "viewpatch_1x1x2_lr2e-5_30trials_step_020000",
         {
             "valid": True,
             "resume_type": "weight-only resume from viewpatch_1x1x2_mmap_bs12_w6_30trials_step_024000",
+            "resume_base_step": 24000,
             "learning_rate": "2e-5 constant",
             "global_batch": 96,
             "pooling": "view-aware patch merge [1,1,2]",
@@ -39,6 +164,7 @@ MANUAL_NOTES: list[tuple[str, dict[str, Any]]] = [
             "valid": True,
             "warning": "unexpectedly low eval; logs confirm checkpoint step_012000 was loaded",
             "resume_type": "weight-only restart from viewpatch [1,1,2] step024000; later full-state resume from step009500",
+            "resume_base_step": 24000,
             "learning_rate": "1e-4 cosine restart",
             "global_batch": 96,
             "pooling": "view-aware patch merge [1,1,2]",
@@ -54,6 +180,7 @@ MANUAL_NOTES: list[tuple[str, dict[str, Any]]] = [
         {
             "valid": True,
             "resume_type": "weight-only restart from viewpatch [1,1,2] step024000; later full-state resume from step009500",
+            "resume_base_step": 24000,
             "learning_rate": "1e-4 cosine restart",
             "global_batch": 96,
             "pooling": "view-aware patch merge [1,1,2]",
@@ -84,6 +211,7 @@ MANUAL_NOTES: list[tuple[str, dict[str, Any]]] = [
         {
             "valid": True,
             "resume_type": "weight-only restart from viewpatch step032000",
+            "resume_base_step": 32000,
             "learning_rate": "2e-5 constant with warmup",
             "global_batch": 128,
             "pooling": "view-aware patch merge [1,2,2]",
@@ -99,6 +227,7 @@ MANUAL_NOTES: list[tuple[str, dict[str, Any]]] = [
         {
             "valid": True,
             "resume_type": "weight-only restart from viewpatch step032000",
+            "resume_base_step": 32000,
             "learning_rate": "2e-5 constant with warmup",
             "global_batch": 128,
             "pooling": "view-aware patch merge [1,2,2]",
@@ -145,6 +274,7 @@ MANUAL_NOTES: list[tuple[str, dict[str, Any]]] = [
             "valid": False,
             "warning": "invalid: old weight-only resume loaded .pt after DeepSpeed prepare; optimizer master weights likely overwrote model weights",
             "resume_type": "weight-only (buggy, do not compare)",
+            "resume_base_step": 28930,
             "learning_rate": "2e-5",
             "global_batch": 96,
             "pooling": "none [1,1]",
@@ -153,6 +283,38 @@ MANUAL_NOTES: list[tuple[str, dict[str, Any]]] = [
             "model": "DINO-S small-video",
             "wan_init": "false",
             "variant": "buggy weight-only fine-tune",
+        },
+    ),
+    (
+        "nopool_weightonly_from_step028930_lr1e-5_extra10ep_30trials_step_",
+        {
+            "valid": True,
+            "resume_type": "fixed weight-only restart from no-pool step028930",
+            "resume_base_step": 28930,
+            "learning_rate": "1e-5 cosine restart",
+            "global_batch": 96,
+            "pooling": "none [1,1]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S small-video",
+            "wan_init": "false",
+            "variant": "no-pool fixed weight-only from step028930, lr1e-5 extra10ep",
+        },
+    ),
+    (
+        "nopool_latest_30trials_step_004000",
+        {
+            "valid": True,
+            "resume_type": "fixed weight-only restart from no-pool step028930",
+            "resume_base_step": 28930,
+            "learning_rate": "1e-5",
+            "global_batch": 96,
+            "pooling": "none [1,1]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S small-video",
+            "wan_init": "false",
+            "variant": "no-pool fixed weight-only from step028930, eval step004000",
         },
     ),
     (
@@ -263,6 +425,89 @@ def get_nested(data: dict[str, Any], dotted: str) -> Any:
             return None
         cur = cur[part]
     return cur
+
+
+def as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_repo_path(path_text: str | None) -> Path | None:
+    if not path_text:
+        return None
+    path = Path(str(path_text))
+    return path if path.is_absolute() else ROOT / path
+
+
+def infer_train_sample_count(cfg: dict[str, Any]) -> int | None:
+    dataset_dirs = get_nested(cfg, "data.train.dataset_dirs")
+    if not isinstance(dataset_dirs, list):
+        return DEFAULT_TRAIN_SAMPLE_COUNT
+
+    total = 0
+    for ds_dir in dataset_dirs:
+        info_path = resolve_repo_path(str(ds_dir))
+        if info_path is None:
+            continue
+        info_path = info_path / "meta" / "info.json"
+        try:
+            info = json.loads(info_path.read_text())
+        except Exception:
+            continue
+        frames = as_int(info.get("total_frames"))
+        if frames is not None:
+            total += frames
+    return total or DEFAULT_TRAIN_SAMPLE_COUNT
+
+
+def estimate_epoch(step: int | None, metadata: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    global_batch = as_int(metadata.get("global_batch"))
+    if step is None or global_batch is None or global_batch <= 0:
+        return {
+            "epoch": None,
+            "run_epoch": None,
+            "resume_base_epoch": None,
+            "steps_per_epoch": None,
+            "resume_base_steps_per_epoch": None,
+            "train_sample_count": None,
+        }
+
+    train_sample_count = infer_train_sample_count(cfg)
+    if train_sample_count is None or train_sample_count <= 0:
+        return {
+            "epoch": None,
+            "run_epoch": None,
+            "resume_base_epoch": None,
+            "steps_per_epoch": None,
+            "resume_base_steps_per_epoch": None,
+            "train_sample_count": None,
+        }
+
+    steps_per_epoch = max((train_sample_count + global_batch - 1) // global_batch, 1)
+    run_epoch = float(step) / float(steps_per_epoch)
+    resume_base_step = as_int(metadata.get("resume_base_step"))
+    resume_base_global_batch = as_int(metadata.get("resume_base_global_batch")) or global_batch
+    resume_base_epoch = 0.0
+    resume_base_steps_per_epoch = None
+    if resume_base_step is not None and resume_base_step > 0 and resume_base_global_batch > 0:
+        resume_base_steps_per_epoch = max(
+            (train_sample_count + resume_base_global_batch - 1) // resume_base_global_batch,
+            1,
+        )
+        resume_base_epoch = float(resume_base_step) / float(resume_base_steps_per_epoch)
+
+    return {
+        "epoch": round(resume_base_epoch + run_epoch, 2),
+        "run_epoch": round(run_epoch, 2),
+        "resume_base_epoch": round(resume_base_epoch, 2) if resume_base_step is not None else None,
+        "steps_per_epoch": steps_per_epoch,
+        "resume_base_steps_per_epoch": resume_base_steps_per_epoch,
+        "train_sample_count": train_sample_count,
+    }
 
 
 def config_for_ckpt(ckpt: str | None) -> dict[str, Any]:
@@ -391,6 +636,10 @@ def load_eval(summary_path: Path) -> dict[str, Any] | None:
     eval_dir = summary_path.parent
     meta = infer_metadata(eval_dir, summary)
     step = parse_step(f"{summary.get('run_id','')} {summary.get('ckpt','')} {eval_dir.name}")
+    cfg = config_for_ckpt(summary.get("ckpt"))
+    if not cfg and isinstance(summary.get("config"), dict):
+        cfg = summary["config"]
+    epoch_info = estimate_epoch(step, meta, cfg)
     suites: dict[str, dict[str, Any]] = {}
     for suite in SUITES:
         stats = (summary.get("suite_stats") or {}).get(suite) or {}
@@ -438,6 +687,12 @@ def load_eval(summary_path: Path) -> dict[str, Any] | None:
         "summary_path": rel(summary_path),
         "ckpt": summary.get("ckpt"),
         "step": step,
+        "epoch": epoch_info["epoch"],
+        "run_epoch": epoch_info["run_epoch"],
+        "resume_base_epoch": epoch_info["resume_base_epoch"],
+        "steps_per_epoch": epoch_info["steps_per_epoch"],
+        "resume_base_steps_per_epoch": epoch_info["resume_base_steps_per_epoch"],
+        "train_sample_count": epoch_info["train_sample_count"],
         "mtime": summary_path.stat().st_mtime,
         "mtime_text": datetime.fromtimestamp(summary_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
         "eval_date": datetime.fromtimestamp(summary_path.stat().st_mtime).strftime("%m-%d %H:%M"),
@@ -456,7 +711,10 @@ def chronological_order(item: dict[str, Any]) -> tuple[float, str]:
 
 
 def collect_training_state() -> dict[str, Any] | None:
-    candidates = sorted((ROOT / "runs").glob("**/config.yaml"), key=lambda p: p.stat().st_mtime)
+    candidates = sorted(
+        (p for p in (ROOT / "runs").glob("**/config.yaml") if "wandb" not in p.parts),
+        key=lambda p: p.stat().st_mtime,
+    )
     if not candidates:
         return None
     latest_cfg = candidates[-1]

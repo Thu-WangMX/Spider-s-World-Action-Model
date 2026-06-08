@@ -408,6 +408,7 @@
               <th>状态</th>
               <th>评测</th>
               <th>step</th>
+              <th>epoch</th>
               <th>Spatial</th>
               <th>Object</th>
               <th>Goal</th>
@@ -503,7 +504,7 @@
     function signatureOf(data) {
       return (data.evals || []).map(e => {
         const meta = e.meta || {};
-        return `${e.id}:${e.mtime}:${e.overall}:${meta.resume_type || ""}:${meta.variant || ""}:${meta.warning || ""}`;
+        return `${e.id}:${e.mtime}:${e.overall}:${e.epoch ?? ""}:${meta.resume_type || ""}:${meta.variant || ""}:${meta.warning || ""}`;
       }).join("|") + `::${data.training_state?.latest_weight || ""}`;
     }
 
@@ -561,6 +562,20 @@
       return best ? `${best.id}` : "-";
     }
 
+    function epochTitle(e) {
+      if (!e.steps_per_epoch) return "";
+      const parts = [
+        `cumulative epoch: ${Number.isFinite(Number(e.epoch)) ? Number(e.epoch).toFixed(2) : "-"}`,
+        `this run epoch: ${Number.isFinite(Number(e.run_epoch)) ? Number(e.run_epoch).toFixed(2) : "-"}`,
+        `steps/epoch: ${e.steps_per_epoch}`,
+        `train samples: ${e.train_sample_count ?? "-"}`
+      ];
+      if (Number.isFinite(Number(e.resume_base_epoch))) {
+        parts.splice(1, 0, `resume base epoch: ${Number(e.resume_base_epoch).toFixed(2)}`);
+      }
+      return parts.join("; ");
+    }
+
     function renderTable(evals) {
       $("evalCount").textContent = `${evals.length} rows`;
       $("evalRows").innerHTML = evals.map(e => {
@@ -576,6 +591,7 @@
           <td>${status}</td>
           <td><strong>${e.id}</strong>${variant}${resume}${warn}</td>
           <td>${e.step ?? "-"}</td>
+          <td title="${epochTitle(e)}">${Number.isFinite(Number(e.epoch)) ? Number(e.epoch).toFixed(2) : "-"}</td>
           ${["libero_spatial", "libero_object", "libero_goal", "libero_10"].map(s => `<td class="${clsScore(e.suites[s]?.score)}">${pct(e.suites[s]?.score)}</td>`).join("")}
           <td class="${clsScore(e.overall)}">${pct(e.overall)}</td>
           <td>${trials}</td>

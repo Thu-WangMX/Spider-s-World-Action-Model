@@ -119,6 +119,7 @@ class DinoVideoDiT(nn.Module):
         latent_patch_size: Tuple[int, int, int] = (1, 1, 1),
         latent_patch_mode: str = "flat",
         latent_num_views: int = 1,
+        output_patch_space: str = "dense",
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -156,6 +157,11 @@ class DinoVideoDiT(nn.Module):
                 "First-frame conditioning and per-token timestep masking assume that "
                 "each DiT video token belongs to a single original frame; got "
                 f"latent_patch_size={self.latent_patch_size}."
+            )
+        self.output_patch_space = str(output_patch_space).strip().lower()
+        if self.output_patch_space not in {"dense", "merged"}:
+            raise ValueError(
+                f"`output_patch_space` must be 'dense' or 'merged', got {output_patch_space!r}"
             )
 
         if num_heads <= 0:
@@ -207,8 +213,15 @@ class DinoVideoDiT(nn.Module):
             [DiTBlock(hidden_dim, attn_head_dim, num_heads, ffn_dim, eps) for _ in range(num_layers)]
         )
 
-        # Output head: hidden_dim → original DINO patch group.
-        self.head = DinoHead(hidden_dim, dino_dim * self.latent_patch_prod, eps)
+        # Output head.  The default dense mode preserves the historical behavior:
+        # each merged token predicts all DINO velocities inside its patch group.
+        # The optional merged mode predicts one DINO velocity per merged token;
+        # training then compares against a fixed patch-mean target in the same
+        # token grid, avoiding dense DINO super-resolution.
+        head_out_dim = dino_dim * self.latent_patch_prod
+        if self.output_patch_space == "merged":
+            head_out_dim = dino_dim
+        self.head = DinoHead(hidden_dim, head_out_dim, eps)
 
         # RoPE frequency tables (3D: temporal + spatial H + spatial W)
         self.freqs = precompute_freqs_cis_3d(attn_head_dim)
@@ -222,10 +235,11 @@ class DinoVideoDiT(nn.Module):
         if self.latent_patch_size != (1, 1, 1):
             logger.info(
                 "DinoVideoDiT learnable latent patch merge enabled: latent_patch_size=%s, "
-                "latent_patch_mode=%s, latent_num_views=%s",
+                "latent_patch_mode=%s, latent_num_views=%s, output_patch_space=%s",
                 self.latent_patch_size,
                 self.latent_patch_mode,
                 self.latent_num_views,
+                self.output_patch_space,
             )
 
     def init_from_wan_dit(self, wan_dit_state_dict: dict[str, torch.Tensor]) -> None:
@@ -463,6 +477,66 @@ class DinoVideoDiT(nn.Module):
             pw=pw,
         )
 
+    def unpatchify_merged(self, x_tokens: torch.Tensor, grid_size: Tuple[int, int, int]) -> torch.Tensor:
+        """Convert one prediction per merged token to a compact DINO grid."""
+        f, h, w = grid_size
+        if self.latent_patch_mode == "view":
+            return rearrange(
+                x_tokens,
+                "b (t v h w) d -> b d t h (v w)",
+                v=self.latent_num_views,
+                t=f,
+                h=h,
+                w=w,
+            )
+        return rearrange(x_tokens, "b (t h w) d -> b d t h w", t=f, h=h, w=w)
+
+    def target_to_output_space(self, x: torch.Tensor) -> torch.Tensor:
+        """Map dense DINO velocity targets to the configured output space.
+
+        Dense mode returns the target unchanged.  Merged mode computes a fixed
+        average over each latent patch group, producing one DINO target vector
+        per merged DiT token.  This keeps the supervision space aligned with
+        the compressed token grid without adding a learnable teacher branch.
+        """
+        if self.output_patch_space == "dense" or self.latent_patch_size == (1, 1, 1):
+            return x
+        if x.ndim != 5:
+            raise ValueError(f"`x` must be 5D [B,D,T,H,W], got shape {tuple(x.shape)}")
+        pt, ph, pw = self.latent_patch_size
+        _, _, num_frames, height_grid, width_grid = x.shape
+        patch_width_grid = width_grid
+        if self.latent_patch_mode == "view":
+            if width_grid % self.latent_num_views != 0:
+                raise ValueError(
+                    "DINO latent width must be divisible by latent_num_views for merged target, "
+                    f"got width={width_grid} and latent_num_views={self.latent_num_views}."
+                )
+            patch_width_grid = width_grid // self.latent_num_views
+        if num_frames % pt != 0 or height_grid % ph != 0 or patch_width_grid % pw != 0:
+            raise ValueError(
+                "DINO latent target grid must be divisible by latent_patch_size, "
+                f"got grid={(num_frames, height_grid, patch_width_grid)} "
+                f"(original width={width_grid}, mode={self.latent_patch_mode}) and "
+                f"latent_patch_size={self.latent_patch_size}."
+            )
+        if self.latent_patch_mode == "view":
+            return rearrange(
+                x,
+                "b d (t pt) (h ph) (v w pw) -> b d t h (v w) (pt ph pw)",
+                v=self.latent_num_views,
+                pt=pt,
+                ph=ph,
+                pw=pw,
+            ).mean(dim=-1)
+        return rearrange(
+            x,
+            "b d (t pt) (h ph) (w pw) -> b d t h w (pt ph pw)",
+            pt=pt,
+            ph=ph,
+            pw=pw,
+        ).mean(dim=-1)
+
     def _view_rearrange_latents(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[-1] % self.latent_num_views != 0:
             raise ValueError(
@@ -672,9 +746,11 @@ class DinoVideoDiT(nn.Module):
         """
         grid_size = pre_state["meta"]["grid_size"]
 
-        # Apply output head: [B, seq_len, hidden_dim] → original DINO patch group.
+        # Apply output head: [B, seq_len, hidden_dim] → configured DINO output space.
         x = self.head(x_tokens, pre_state["t"])
 
+        if self.output_patch_space == "merged":
+            return self.unpatchify_merged(x, grid_size)
         return self.unpatchify(x, grid_size)
 
     def forward(

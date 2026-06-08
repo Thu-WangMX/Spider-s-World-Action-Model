@@ -198,6 +198,7 @@ class FastWAM_DINO(nn.Module):
             latent_patch_size=tuple(video_dit_config.get("latent_patch_size", [1, 1, 1])),
             latent_patch_mode=video_dit_config.get("latent_patch_mode", "flat"),
             latent_num_views=video_dit_config.get("latent_num_views", 1),
+            output_patch_space=video_dit_config.get("output_patch_space", "dense"),
         ).to(device=device, dtype=torch_dtype)
 
         # Optionally initialize DinoVideoDiT from Wan2.2 Video DiT weights
@@ -730,6 +731,7 @@ class FastWAM_DINO(nn.Module):
         # === Compute losses ===
         # Skip first frame (it's clean conditioning, not predicted)
         pred_video = pred_video[:, :, 1:]
+        target_video = self.video_expert.target_to_output_space(target_video)
         target_video = target_video[:, :, 1:]
 
         loss_video_per_sample = self._compute_video_loss_per_sample(
