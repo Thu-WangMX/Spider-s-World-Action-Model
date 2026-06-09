@@ -1224,3 +1224,224 @@ full tiny FastWAM_DINO training_loss/backward works in merged mode: OK
 Hydra train/eval configs compose with expected old/new behavior: OK
 train-time eval uses training_loss; rollout infer_action does not use video head: OK
 ```
+
+### 2026-06-09 当前最新进展与下一步 handoff
+
+#### 1. DINO no-pool 低学习率续训到 20 epoch 后刷新最佳结果
+
+从原始 no-pool `step_028930` 做 weight-only resume，学习率 `1e-5`，继续约 10 epoch 后，已经完成 30-trials LIBERO 评测并更新到 leaderboard / `DINO_TOKEN_PROCESSING_COMPARISON.md` / `VAE_SMALLVIDEO_VS_DINO_SMALLVIDEO_REPORT.md`。
+
+关键结果：
+
+```text
+run:
+  runs/libero_dino_s_smallvideo_2cam_224_1e-4/
+    nopool_weightonly_from_step028930_lr1e-5_extra10ep_2026-06-05_18-05-35
+
+eval:
+  evaluate_results/libero/
+    nopool_weightonly_from_step028930_lr1e-5_extra10ep_30trials_step_026000_8gpu_mtp4_delayed
+    nopool_weightonly_from_step028930_lr1e-5_extra10ep_30trials_step_028000_8gpu_mtp4_delayed
+    nopool_weightonly_from_step028930_lr1e-5_extra10ep_30trials_step_028930_8gpu_mtp4_delayed
+```
+
+30-trials 成绩：
+
+| ckpt | global bs | cumulative epoch | Spatial | Object | Goal | LIBERO-10 | Overall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| original no-pool `step_028930` | 96 | 10.00 | 98.67 | 99.33 | 92.33 | 84.00 | 93.58 |
+| lr1e-5 resume `step_026000` | 96 | 18.99 | 97.67 | 99.00 | 97.33 | 86.33 | 95.08 |
+| lr1e-5 resume `step_028000` | 96 | 19.68 | 97.67 | 99.00 | 96.67 | 87.00 | 95.08 |
+| lr1e-5 resume `step_028930` | 96 | 20.00 | 98.00 | 98.33 | 98.67 | 90.00 | 96.25 |
+
+结论：
+
+1. no-pool DINO 继续低学习率 weight-only 训练确实涨分，没有训崩。
+2. 最大增益来自 `Goal` 和 `LIBERO-10`，尤其 LIBERO-10 从 `84.00` 提升到 `90.00`。
+3. 当前 best 是 `96.25 Overall`，已经明显高于 VAE smallvideo 20 epoch 的 `91.33 Overall`。
+4. 因为 LIBERO benchmark 可能偏简单，后续不能只靠这个分数讲故事；但作为当前路线选择，no-pool DINO 是主线。
+
+#### 2. VAE smallvideo 对齐实验正在跑，等待结果
+
+为了排除 VAE vs DINO 对比里 loss 权重不一致的问题，已经启动 VAE smallvideo 的 loss 对齐控制实验：
+
+```text
+run:
+  runs/libero_vae_smallvideo_2cam224_1e-4/
+    vae_smallvideo_loss005_5_bs24_4gpu_20ep_stepmatch_2026-06-08_09-18-17
+```
+
+配置重点：
+
+```text
+task=libero_vae_smallvideo_2cam224_1e-4
+batch_size=24
+gradient_accumulation_steps=1
+num_gpus=4
+global_bs=96
+num_workers=8
+num_epochs=20
+learning_rate=1e-4
+lambda_video=0.05
+lambda_action=5.0
+```
+
+这个实验的目的不是追最高分，而是回答：
+
+```text
+当 VAE smallvideo 和 DINO no-pool 对齐 lambda_video/lambda_action，
+并且 global bs 也接近 no-pool 的 96 时，
+VAE smallvideo 是否还能缩小和 DINO no-pool 的差距？
+```
+
+当前判断：
+
+1. 如果 VAE 对齐后仍明显低于 DINO no-pool，说明差距更可能来自 representation / token dynamics，而不是 loss 权重。
+2. 如果 VAE 对齐后明显涨分，需要重新评估 VAE baseline，避免过早下结论。
+
+#### 3. viewpatch [1,2,2] merged-token loss 已评测，不建议作为下一主线
+
+merged-token loss 变体的 `step_021700` 已完成 30-trials 评测：
+
+```text
+eval:
+  evaluate_results/libero/viewpatch_1x2x2_mergedloss_30trials_step_021700_rerun_20260608_030217
+
+ckpt:
+  runs/libero_dino_s_smallvideo_2cam_224_viewpatch_1x2x2_mergedloss_1e-4/
+    viewpatch_1x2x2_mergedloss_mmap_bs16_w6_10ep_2026-06-06_17-24-15/
+      checkpoints/weights/step_021700.pt
+```
+
+结果：
+
+| Variant | ckpt | Spatial | Object | Goal | LIBERO-10 | Overall |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| viewpatch `[1,2,2]` + merged-token loss | `step_021700` | 95.67 | 98.33 | 86.33 | 64.67 | 86.25 |
+
+结论：
+
+1. merged-token loss 没有解决 viewpatch 的核心问题，反而整体很差。
+2. 目前不建议继续把主力资源放在 viewpatch loss-space 上。
+3. viewpatch 可以作为 ablation 记录，但下一步优先级低于 no-pool / avgpool / VAE 对照 / memory。
+
+#### 4. 下一步建议：先做 avgpool 20 epoch 对照，再考虑 memory
+
+当前 no-pool 已经从 10 epoch 涨到 20 epoch。为了避免被质疑“no-pool 只是训得更久”，下一步建议先做 avgpool 的同类 weight-only 续训对照：
+
+```text
+avgpool 10ep-ish ckpt
+  -> weight-only resume
+  -> lr=1e-5
+  -> 再训约 10 epoch
+  -> 看 avgpool 是否也能接近 no-pool 20epoch 的 96.25
+```
+
+注意：
+
+1. avgpool 对应 `latent_spatial_pool=[1,2]`，不能用 no-pool 的 `pool1x1` mmap cache。
+2. 本地目前存在的 avgpool cache 是：
+
+```text
+data/dino_latents_cache/libero_dino_s_2cam224_pool1x2_frame_exact
+```
+
+3. 本地没有 `pool1x2_frame_exact_mmap`，所以不能写成：
+
+```text
+data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact_mmap
+```
+
+那个是 no-pool cache，对应 `latent_spatial_pool=[1,1]`。
+
+4. 历史 avgpool 训练配置是：
+
+```text
+batch_size=8
+gradient_accumulation_steps=2
+num_workers=8
+global_bs=8 * 8 * 2 = 128
+cache=./data/dino_latents_cache/libero_dino_s_2cam224_pool1x2_frame_exact
+```
+
+5. no-pool 的 `worker=8` 顶不住主要和 no-pool mmap / IO 行为有关；avgpool 历史就是 `num_workers=8`，而且 `pool1x2` token 更少，可以先按历史配置跑。如果 GPU 利用率低或 NFS 压力大，再降到 `num_workers=4`。
+
+avgpool 8 卡续训命令：
+
+```bash
+cd /data73/mingxinwang/Spider-s-World-Action-Model
+source /data73/envs/miniconda3/etc/profile.d/conda.sh
+conda activate spiderwam
+
+export PYTHON=/home/wangmx2605/.conda/envs/spiderwam/bin/python3.10
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export WAIT_FOR_GPUS=0
+export MPLCONFIGDIR=/tmp/matplotlib-cache
+export MASTER_PORT=29573
+
+RESUME_WEIGHTS=/data73/mingxinwang/Spider-s-World-Action-Model/runs/libero_dino_s_smallvideo_2cam_224_1e-4/2026-05-20_11-53-25/checkpoints/weights/step_043400.pt
+RUN_ID=avgpool_weightonly_from_step043400_lr1e-5_extra10ep_$(date +%Y-%m-%d_%H-%M-%S)
+
+bash scripts/train_zero1.sh 8 \
+  task=libero_dino_s_smallvideo_2cam_224_1e-4 \
+  name="$RUN_ID" \
+  resume="$RESUME_WEIGHTS" \
+  max_steps=21700 \
+  save_every=2000 \
+  eval_every=200 \
+  batch_size=8 \
+  gradient_accumulation_steps=2 \
+  data.train.num_workers=8 \
+  data.train.prefetch_factor=1 \
+  data.train.persistent_workers=true \
+  learning_rate=1e-5 \
+  lr_scheduler_type=cosine \
+  model.loss.lambda_video=0.05 \
+  model.loss.lambda_action=5.0 \
+  model.dino_config.load_backbone=false \
+  'model.dino_config.latent_spatial_pool=[1,2]' \
+  model.dino_config.encode_microbatch_size=16 \
+  data.train.dino_latent_cache_dir=./data/dino_latents_cache/libero_dino_s_2cam224_pool1x2_frame_exact \
+  data.train.dino_latent_cache_mode=frame \
+  data.train.dino_latent_cache_required=true \
+  model.video_dit_init_from_wan=false \
+  model.video_dit_pretrained_path=checkpoints/DinoVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt \
+  wandb.enabled=true \
+  wandb.name="$RUN_ID"
+```
+
+说明：
+
+1. leaderboard 里 avgpool 更高分的是 `step_042000`，但本地 `2026-05-20_11-53-25/checkpoints/weights/` 目前能确认存在的是 `step_043400.pt`。
+2. 如果之后找到 `step_042000.pt`，只需要替换 `RESUME_WEIGHTS`。
+3. `max_steps=21700` 约等于 avgpool 在 global bs 128 下再训 10 epoch。
+
+#### 5. /data32 磁盘可用但当前无写权限
+
+`/data73` 当前空间压力较大：
+
+```text
+/data73: 7.0T total, 6.4T used, 606G available, 92% used
+/data32: 7.0T total, 50G used, 7.0T available, 1% used
+```
+
+但当前用户无法直接在 `/data32` 下创建目录：
+
+```text
+mkdir: cannot create directory '/data32/mingxinwang': Permission denied
+/data32 is owned by root:root, mode drwxr-xr-x
+```
+
+需要管理员或有 sudo 权限的人先执行：
+
+```bash
+sudo mkdir -p /data32/mingxinwang
+sudo chown -R wangmx2605:wangmx2605 /data32/mingxinwang
+```
+
+之后建议把大 ckpt / 新 run 输出迁移到 `/data32/mingxinwang`，避免继续压 `/data73` 的 NFS 空间。做法可以是：
+
+1. 训练命令直接指定 run/output dir 到 `/data32/mingxinwang/...`；
+2. 或者在 repo 的 `runs/...` 子目录下建立软链接，实际数据落到 `/data32`。
+
+具体用哪种方式需要看训练代码最终采用哪个字段控制输出目录；下一次开新对话时优先检查 `scripts/train_zero1.sh` 和 trainer 对 `name/output_dir/run_dir` 的解析。

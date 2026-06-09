@@ -12,12 +12,12 @@
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | VAE smallvideo | `step_021700` | 256 | 20.00 | 92.00 | 98.00 | 94.00 | 81.33 | 91.33 |
 | DINO no-pool | `step_028930` | 96 | 10.00 | 98.67 | 99.33 | 92.33 | 84.00 | 93.58 |
-| DINO no-pool + lr1e-5 weight-only | `step_020000` | 96 | 16.91 | 96.67 | 99.33 | 97.00 | 86.67 | 94.92 |
+| DINO no-pool + lr1e-5 weight-only | `step_028930` | 96 | 20.00 | 98.00 | 98.33 | 98.67 | 90.00 | 96.25 |
 
 核心判断：
 
 1. DINO no-pool 在约 10 epoch 就达到 `93.58`，已经超过 VAE smallvideo 20 epoch 的 `91.33`。
-2. DINO no-pool 继续 weight-only 低学习率训练后，在约 16.91 累计 epoch 达到 `94.92`，比 VAE smallvideo 最好点高 `+3.59` Overall。
+2. DINO no-pool 继续 weight-only 低学习率训练后，在 20.00 累计 epoch 达到 `96.25`，比 VAE smallvideo 20 epoch 高 `+4.92` Overall。
 3. VAE smallvideo 的瓶颈主要在 Spatial 和 LIBERO-10：Object 一直很高，但 Spatial、长任务和综合分明显低于 DINO no-pool。
 4. VAE smallvideo 20 epoch 后再 weight-only lr1e-5 续训没有提升，反而从 `91.33` 下降到 `91.00 / 90.00 / 89.67`。
 5. 因此，如果目标是 LIBERO 分数，当前证据支持优先继续 DINO no-pool / DINO token 路线，而不是 VAE smallvideo 路线。
@@ -75,7 +75,7 @@ VAE smallvideo 趋势：
 - 20.00 epoch 后 weight-only lr1e-5：`91.33 -> 91.00 -> 90.00 -> 89.67`，没有继续增长。
 - Object 几乎一直很强，约 `97-98`。
 - Spatial 从 `87.67` 涨到 `92.00`，但仍低于 DINO no-pool。
-- LIBERO-10 从 `76.67` 涨到 `81.33`，仍明显低于 DINO no-pool 最新的 `86.67`。
+- LIBERO-10 从 `76.67` 涨到 `81.33`，仍明显低于 DINO no-pool 最新的 `90.00`。
 
 ## 4. DINO no-pool 结果曲线
 
@@ -95,11 +95,15 @@ DINO no-pool 使用 frozen DINO-S token，`latent_spatial_pool=[1,1]`，保留�
 | weight-only lr1e-5 from `028930` | `step_016000` | 96 | 5.53 | 15.53 | 96.00 | 96.33 | 97.33 | 85.67 | 93.83 |
 | weight-only lr1e-5 from `028930` | `step_020000` | 96 | 6.91 | 16.91 | 96.67 | 99.33 | 97.00 | 86.67 | 94.92 |
 | weight-only lr1e-5 from `028930` | `step_022000` | 96 | 7.60 | 17.60 | 98.00 | 98.33 | 96.67 | 86.00 | 94.75 |
+| weight-only lr1e-5 from `028930` | `step_024000` | 96 | 8.30 | 18.30 | 98.33 | 99.00 | 95.67 | 86.00 | 94.75 |
+| weight-only lr1e-5 from `028930` | `step_026000` | 96 | 8.99 | 18.99 | 97.67 | 99.00 | 97.33 | 86.33 | 95.08 |
+| weight-only lr1e-5 from `028930` | `step_028000` | 96 | 9.68 | 19.68 | 97.67 | 99.00 | 96.67 | 87.00 | 95.08 |
+| weight-only lr1e-5 from `028930` | `step_028930` | 96 | 10.00 | 20.00 | 98.00 | 98.33 | 98.67 | 90.00 | 96.25 |
 
 说明：
 
 - `step_004000` 存在一次历史重复评测，曾得到 `93.58`；本表使用当前同一续训 run 下的 `30trials_step_004000` 结果 `93.33`。
-- `step_012000` 有一次回落，但 `step_016000/020000/022000` 又继续上涨或维持高位，说明 DINO no-pool 续训并没有明显“训崩”，反而还有增长空间。
+- `step_012000` 有一次回落，但 `step_016000` 之后总体继续上涨，最终 `step_028930` 达到 `96.25`。这说明 DINO no-pool 续训没有训崩，而且长任务 LIBERO-10 仍有明显增长空间。
 
 ## 5. 同 epoch / 近似训练量对比
 
@@ -118,24 +122,24 @@ DINO no-pool 用更少训练量已经超过 VAE smallvideo 约 `+4.91` Overall�
 | 对比点 | epoch | Spatial | Object | Goal | LIBERO-10 | Overall |
 |---|---:|---:|---:|---:|---:|---:|
 | VAE smallvideo `step_021700` | 20.00 | 92.00 | 98.00 | 94.00 | 81.33 | 91.33 |
-| DINO no-pool `step_020000` | 16.91 | 96.67 | 99.33 | 97.00 | 86.67 | 94.92 |
+| DINO no-pool `step_028930` | 20.00 | 98.00 | 98.33 | 98.67 | 90.00 | 96.25 |
 
 虽然 DINO no-pool 的累计 epoch 更少，仍然高出：
 
 | Metric | DINO - VAE |
 |---|---:|
-| Spatial | +4.67 |
-| Object | +1.33 |
-| Goal | +3.00 |
-| LIBERO-10 | +5.34 |
-| Overall | +3.59 |
+| Spatial | +6.00 |
+| Object | +0.33 |
+| Goal | +4.67 |
+| LIBERO-10 | +8.67 |
+| Overall | +4.92 |
 
 ### 5.3 VAE 继续训 vs DINO 继续训
 
 | 路线 | resume 起点 | 后续训练 | Overall 变化 |
 |---|---:|---:|---:|
 | VAE smallvideo | 20.00 epoch | +5.00 epoch, lr1e-5 weight-only | 91.33 -> 89.67 |
-| DINO no-pool | 10.00 epoch | +6.91 epoch, lr1e-5 weight-only | 93.58 -> 94.92 |
+| DINO no-pool | 10.00 epoch | +10.00 epoch, lr1e-5 weight-only | 93.58 -> 96.25 |
 
 同样是低学习率 weight-only 继续训练，DINO no-pool 有收益，VAE smallvideo 没有收益。
 
@@ -190,7 +194,7 @@ DINO no-pool 不做 avg pooling，也不做 viewpatch merge，完整保留双相
 
 优先级建议：
 
-1. 继续把 DINO no-pool `step_024000` 之后的后续 ckpt 补齐评测，确认 `94.92` 附近是否稳定。
+1. 当前 DINO no-pool 20 epoch 已达到 `96.25`，下一步应优先确认新 VAE loss 对齐实验能否缩小差距，而不是继续纠结 viewpatch。
 2. 当前 VAE smallvideo 可以作为 baseline 放进报告，但不建议继续主力投入。
 3. 如果还要做 VAE 对照，建议只做一个更干净的 ablation：把 VAE smallvideo 的 action/video loss 权重对齐到 DINO，即 `lambda_video=0.05, lambda_action=5.0`，否则“表征差异”和“loss 权重差异”会纠缠。
 4. DINO no-pool 已经是当前最强路线，下一步更值得做 memory/history 或 5B backbone，而不是继续 viewpatch merged-token loss。
@@ -215,4 +219,8 @@ evaluate_results/libero/nopool_weightonly_from_step028930_lr1e-5_extra10ep_30tri
 evaluate_results/libero/nopool_weightonly_from_step028930_lr1e-5_extra10ep_30trials_step_016000_4gpu_serial
 evaluate_results/libero/nopool_weightonly_from_step028930_lr1e-5_extra10ep_30trials_step_020000_4gpu_serial
 evaluate_results/libero/nopool_weightonly_from_step028930_lr1e-5_extra10ep_30trials_step_022000
+evaluate_results/libero/nopool_weightonly_from_step028930_lr1e-5_extra10ep_30trials_step_024000_4gpu_serial
+evaluate_results/libero/nopool_weightonly_from_step028930_lr1e-5_extra10ep_30trials_step_026000_8gpu_mtp4_delayed
+evaluate_results/libero/nopool_weightonly_from_step028930_lr1e-5_extra10ep_30trials_step_028000_8gpu_mtp4_delayed
+evaluate_results/libero/nopool_weightonly_from_step028930_lr1e-5_extra10ep_30trials_step_028930_8gpu_mtp4_delayed
 ```
