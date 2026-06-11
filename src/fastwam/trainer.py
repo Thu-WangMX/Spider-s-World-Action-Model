@@ -86,12 +86,15 @@ class Wan22Trainer:
         self._load_weight_checkpoint_before_prepare()
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
-        # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
+        # This keeps DiT (+ optional small context heads) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
         trainable_params = list(self.model.dit.parameters())
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
             trainable_params.extend(list(proprio_encoder.parameters()))
+        intent_encoder = getattr(self.model, "intent_encoder", None)
+        if intent_encoder is not None:
+            trainable_params.extend(list(intent_encoder.parameters()))
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -324,6 +327,10 @@ class Wan22Trainer:
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+        intent_encoder = getattr(model, "intent_encoder", None)
+        if intent_encoder is not None:
+            intent_encoder.train()
+            intent_encoder.requires_grad_(True)
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -334,6 +341,7 @@ class Wan22Trainer:
         context = sample.get("context", None)
         context_mask = sample.get("context_mask", None)
         dino_latents = sample.get("dino_latents", None)
+        history_dino_latents = sample.get("history_dino_latents", None)
         action_is_pad = sample.get("action_is_pad", None)
         image_is_pad = sample.get("image_is_pad", None)
 
@@ -413,6 +421,25 @@ class Wan22Trainer:
                     f"dino={tuple(dino_latents.shape)} video={tuple(video.shape)}"
                 )
 
+        if history_dino_latents is not None:
+            if not isinstance(history_dino_latents, torch.Tensor):
+                raise TypeError(
+                    f"`sample['history_dino_latents']` must be a torch.Tensor, "
+                    f"got {type(history_dino_latents)}"
+                )
+            if history_dino_latents.ndim == 4:
+                history_dino_latents = history_dino_latents.unsqueeze(0)
+            if history_dino_latents.ndim != 5:
+                raise ValueError(
+                    "`sample['history_dino_latents']` must be [D,T,H,W] or [B,D,T,H,W], "
+                    f"got {tuple(history_dino_latents.shape)}"
+                )
+            if history_dino_latents.shape[0] != video.shape[0]:
+                raise ValueError(
+                    "Eval history DINO latent/video batch mismatch: "
+                    f"history={tuple(history_dino_latents.shape)} video={tuple(video.shape)}"
+                )
+
         if action_is_pad is not None:
             if not isinstance(action_is_pad, torch.Tensor):
                 action_is_pad = torch.as_tensor(action_is_pad, dtype=torch.bool)
@@ -437,6 +464,7 @@ class Wan22Trainer:
             "context": context,
             "context_mask": context_mask,
             "dino_latents": dino_latents,
+            "history_dino_latents": history_dino_latents,
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
             "action_horizon": action_horizon,
@@ -558,6 +586,8 @@ class Wan22Trainer:
                 infer_kwargs["context_mask"] = sample["context_mask"][0]
             else:
                 infer_kwargs["prompt"] = prompt
+            if sample.get("history_dino_latents") is not None:
+                infer_kwargs["history_dino_latents"] = sample["history_dino_latents"][0]
 
             pred = model.infer_action(**infer_kwargs)
             action_metrics = self._compute_eval_action_metrics(sample, pred.get("action"), action)

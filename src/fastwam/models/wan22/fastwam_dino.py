@@ -24,6 +24,7 @@ from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
 from .dino_encoder import DinoVideoEncoder
+from .dino_intent import DINOHistoryIntentResampler
 from .dino_video_dit import DinoVideoDiT
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -58,6 +59,8 @@ class FastWAM_DINO(nn.Module):
         action_expert: ActionDiT,
         mot: MoT,
         dino_encoder: DinoVideoEncoder,
+        intent_encoder: Optional[DINOHistoryIntentResampler] = None,
+        intent_config: Optional[dict[str, Any]] = None,
         text_encoder=None,
         tokenizer=None,
         text_dim: Optional[int] = None,
@@ -81,6 +84,14 @@ class FastWAM_DINO(nn.Module):
         self.dit = self.mot
 
         self.dino_encoder = dino_encoder
+        self.intent_encoder = intent_encoder
+        self.intent_config = dict(intent_config or {})
+        history_offsets = self.intent_config.get("history_offsets", None)
+        self.intent_history_frame_count = (
+            len(history_offsets)
+            if self.intent_encoder is not None and history_offsets is not None
+            else None
+        )
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
 
@@ -151,6 +162,7 @@ class FastWAM_DINO(nn.Module):
         video_dit_init_from_wan: bool = False,
         video_dit_pretrained_path: Optional[str] = None,
         wan_model_id: str = "Wan-AI/Wan2.2-TI2V-5B",
+        intent_config: Optional[dict[str, Any]] = None,
     ):
         """Create FastWAM_DINO from configuration dicts."""
         if video_dit_init_from_wan and video_dit_pretrained_path:
@@ -293,6 +305,37 @@ class FastWAM_DINO(nn.Module):
             mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
         )
 
+        intent_config = dict(intent_config or {})
+        intent_encoder = None
+        if bool(intent_config.get("enabled", False)):
+            history_offsets = intent_config.get(
+                "history_offsets",
+                intent_config.get("history_dino_frame_offsets", [-8, -4, 0]),
+            )
+            history_offsets = [int(offset) for offset in history_offsets]
+            if len(history_offsets) == 0:
+                raise ValueError("`intent_config.history_offsets` must contain at least one frame offset.")
+            intent_config["history_offsets"] = history_offsets
+            max_history_frames = int(
+                intent_config.get("max_history_frames", max(1, len(history_offsets)))
+            )
+            if max_history_frames < len(history_offsets):
+                raise ValueError(
+                    "`intent_config.max_history_frames` must be >= len(history_offsets), "
+                    f"got {max_history_frames} and {len(history_offsets)}."
+                )
+            intent_encoder = DINOHistoryIntentResampler(
+                dino_dim=int(dino_config.get("feature_dim", 1024)),
+                text_dim=int(video_dit_config.get("text_dim", text_dim)),
+                num_intent_tokens=int(intent_config.get("num_intent_tokens", 8)),
+                resampler_dim=int(intent_config.get("resampler_dim", 1024)),
+                num_layers=int(intent_config.get("num_resampler_layers", 2)),
+                num_heads=int(intent_config.get("num_heads", 8)),
+                max_history_frames=max_history_frames,
+                mlp_ratio=float(intent_config.get("mlp_ratio", 4.0)),
+                dropout=float(intent_config.get("dropout", 0.0)),
+            ).to(device=device, dtype=torch_dtype)
+
 
         # Optionally load text encoder
         loaded_text_encoder = text_encoder
@@ -345,6 +388,8 @@ class FastWAM_DINO(nn.Module):
             action_expert=action_expert,
             mot=mot,
             dino_encoder=dino_encoder,
+            intent_encoder=intent_encoder,
+            intent_config=intent_config,
             text_encoder=loaded_text_encoder,
             tokenizer=loaded_tokenizer,
             text_dim=text_dim,
@@ -410,6 +455,62 @@ class FastWAM_DINO(nn.Module):
             torch.cat([context, proprio_token], dim=1),
             torch.cat([context_mask, proprio_mask], dim=1),
         )
+
+    def _append_intent_to_context(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        intent_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append Short-DINO-Intent tokens after text/proprio context."""
+        if intent_tokens.ndim != 3:
+            raise ValueError(
+                f"`intent_tokens` must be 3D [B,K,D], got shape {tuple(intent_tokens.shape)}"
+            )
+        if intent_tokens.shape[0] != context.shape[0]:
+            raise ValueError(
+                f"Batch mismatch between context and intent tokens: "
+                f"{context.shape[0]} vs {intent_tokens.shape[0]}"
+            )
+        if intent_tokens.shape[2] != self.text_dim:
+            raise ValueError(
+                f"Intent token dim must match text_dim={self.text_dim}, "
+                f"got {intent_tokens.shape[2]}"
+            )
+        intent_mask = torch.ones(
+            (context_mask.shape[0], intent_tokens.shape[1]),
+            dtype=torch.bool,
+            device=context_mask.device,
+        )
+        return (
+            torch.cat([context, intent_tokens.to(dtype=context.dtype)], dim=1),
+            torch.cat([context_mask, intent_mask], dim=1),
+        )
+
+    def _encode_history_intent(self, history_dino_latents: torch.Tensor) -> torch.Tensor:
+        if self.intent_encoder is None:
+            raise RuntimeError("Intent encoder is disabled.")
+        if history_dino_latents.ndim != 5:
+            raise ValueError(
+                f"`history_dino_latents` must be [B,D,T,H,W], got "
+                f"{tuple(history_dino_latents.shape)}"
+            )
+        if (
+            self.intent_history_frame_count is not None
+            and history_dino_latents.shape[2] != self.intent_history_frame_count
+        ):
+            raise ValueError(
+                "History DINO frame count must match intent history offsets: "
+                f"got T={history_dino_latents.shape[2]}, "
+                f"expected {self.intent_history_frame_count}."
+            )
+        self._validate_dino_latent_shape(history_dino_latents)
+        history_dino_latents = history_dino_latents.to(
+            device=self.device,
+            dtype=self.torch_dtype,
+            non_blocking=True,
+        )
+        return self.intent_encoder(history_dino_latents)
 
     @torch.no_grad()
     def _encode_video_dino(self, video_tensor: torch.Tensor) -> torch.Tensor:
@@ -536,6 +637,7 @@ class FastWAM_DINO(nn.Module):
         Args:
             sample: Dict with keys 'video' [B, 3, T, H, W], 'action' [B, T_a, a_dim],
                     'context' [B, L, D], 'context_mask' [B, L], optionally 'proprio',
+                    optionally 'history_dino_latents' when intent_config.enabled=true,
                     'action_is_pad', 'image_is_pad'.
 
         Returns:
@@ -546,6 +648,7 @@ class FastWAM_DINO(nn.Module):
         context = sample["context"]
         context_mask = sample["context_mask"]
         proprio = sample.get("proprio", None)
+        history_dino_latents = sample.get("history_dino_latents", None)
 
         if "action" not in sample:
             raise ValueError("`action` is required for training.")
@@ -610,6 +713,28 @@ class FastWAM_DINO(nn.Module):
                 context=context,
                 context_mask=context_mask,
                 proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
+            )
+
+        if self.intent_encoder is not None:
+            if history_dino_latents is None:
+                raise ValueError(
+                    "`history_dino_latents` is required when `intent_config.enabled=true`."
+                )
+            if history_dino_latents.ndim != 5:
+                raise ValueError(
+                    f"`history_dino_latents` must be 5D [B,D,T,H,W], got "
+                    f"{tuple(history_dino_latents.shape)}"
+                )
+            if history_dino_latents.shape[0] != batch_size:
+                raise ValueError(
+                    f"Batch mismatch between `history_dino_latents` and `action`: "
+                    f"{history_dino_latents.shape[0]} vs {batch_size}"
+                )
+            intent_tokens = self._encode_history_intent(history_dino_latents)
+            context, context_mask = self._append_intent_to_context(
+                context=context,
+                context_mask=context_mask,
+                intent_tokens=intent_tokens,
             )
 
         action = action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
@@ -805,6 +930,8 @@ class FastWAM_DINO(nn.Module):
         self,
         prompt: Optional[str] = None,
         input_image: Optional[torch.Tensor] = None,
+        history_dino_latents: Optional[torch.Tensor] = None,
+        history_video: Optional[torch.Tensor] = None,
         action_horizon: int = 16,
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
@@ -825,6 +952,8 @@ class FastWAM_DINO(nn.Module):
         Args:
             prompt: Text instruction (mutually exclusive with context/context_mask).
             input_image: [1, 3, H, W] or [3, H, W] current observation image.
+            history_dino_latents: Optional [1,D,T_h,H_g,W_g] or [D,T_h,H_g,W_g] history DINO cache.
+            history_video: Optional history RGB frames, [T_h,3,H,W], [1,T_h,3,H,W], or [1,3,T_h,H,W].
             action_horizon: Number of action timesteps to predict.
             proprio: [D] or [1, D] proprioception state.
             context: [1, L, D] pre-computed text embeddings.
@@ -902,6 +1031,66 @@ class FastWAM_DINO(nn.Module):
                 context=context, context_mask=context_mask, proprio=proprio
             )
 
+        if self.intent_encoder is not None:
+            if history_dino_latents is not None and history_video is not None:
+                raise ValueError("Provide only one of `history_dino_latents` or `history_video`.")
+            if history_dino_latents is not None:
+                if history_dino_latents.ndim == 4:
+                    history_dino_latents = history_dino_latents.unsqueeze(0)
+                history_dino_latents = history_dino_latents.to(
+                    device=self.device, dtype=self.torch_dtype, non_blocking=True
+                )
+            elif history_video is not None:
+                if history_video.ndim == 4:
+                    # [T,3,H,W] -> [1,3,T,H,W]
+                    if history_video.shape[1] != 3:
+                        raise ValueError(
+                            f"`history_video` as [T,3,H,W] must have channel dim=3, "
+                            f"got {tuple(history_video.shape)}"
+                        )
+                    history_video = history_video.permute(1, 0, 2, 3).unsqueeze(0)
+                elif history_video.ndim == 5:
+                    if history_video.shape[0] != 1:
+                        raise ValueError(
+                            f"`history_video` inference batch size must be 1, got "
+                            f"{tuple(history_video.shape)}"
+                        )
+                    if history_video.shape[1] == 3:
+                        pass  # [1,3,T,H,W]
+                    elif history_video.shape[2] == 3:
+                        history_video = history_video.permute(0, 2, 1, 3, 4)
+                    else:
+                        raise ValueError(
+                            f"`history_video` must be [1,3,T,H,W] or [1,T,3,H,W], "
+                            f"got {tuple(history_video.shape)}"
+                        )
+                else:
+                    raise ValueError(
+                        f"`history_video` must be 4D or 5D, got {tuple(history_video.shape)}"
+                    )
+                history_video = history_video.to(device=self.device, dtype=self.torch_dtype)
+                history_dino_latents = self._encode_video_dino(history_video)
+            elif bool(self.intent_config.get("infer_repeat_current_if_missing", False)):
+                history_count = len(
+                    self.intent_config.get(
+                        "history_offsets",
+                        self.intent_config.get("history_dino_frame_offsets", [-8, -4, 0]),
+                    )
+                )
+                history_dino_latents = first_frame_latents.expand(-1, -1, history_count, -1, -1)
+            else:
+                raise ValueError(
+                    "`history_dino_latents` or `history_video` is required for inference when "
+                    "`intent_config.enabled=true`."
+                )
+
+            intent_tokens = self._encode_history_intent(history_dino_latents)
+            context, context_mask = self._append_intent_to_context(
+                context=context,
+                context_mask=context_mask,
+                intent_tokens=intent_tokens,
+            )
+
         # Video prefill: encode first frame, cache KV
         timestep_video = torch.zeros(
             (first_frame_latents.shape[0],),
@@ -975,6 +1164,9 @@ class FastWAM_DINO(nn.Module):
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+        if self.intent_encoder is not None:
+            payload["intent_encoder"] = self.intent_encoder.state_dict()
+            payload["intent_config"] = self.intent_config
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -994,6 +1186,13 @@ class FastWAM_DINO(nn.Module):
             )
         if self.proprio_encoder is not None and "proprio_encoder" in checkpoint:
             self.proprio_encoder.load_state_dict(checkpoint["proprio_encoder"])
+        if self.intent_encoder is not None:
+            if "intent_encoder" in checkpoint:
+                self.intent_encoder.load_state_dict(checkpoint["intent_encoder"])
+            else:
+                logger.info(
+                    "Checkpoint has no `intent_encoder`; keeping current intent encoder initialization."
+                )
         if optimizer is not None and "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
         step = checkpoint.get("step", None)

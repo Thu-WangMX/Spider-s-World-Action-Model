@@ -250,6 +250,7 @@ def create_fastwam_joint(
 def create_fastwam_dino(
     dino_config,
     video_dit_config,
+    intent_config=None,
     action_dit_config=None,
     tokenizer_model_id: str = "Wan-AI/Wan2.1-T2V-1.3B",
     tokenizer_max_len: int = 512,
@@ -273,6 +274,13 @@ def create_fastwam_dino(
         dino_config = OmegaConf.to_container(dino_config, resolve=True)
     if not isinstance(dino_config, dict):
         raise ValueError(f"`dino_config` must resolve to a dict, got {type(dino_config)}")
+
+    if isinstance(intent_config, DictConfig):
+        intent_config = OmegaConf.to_container(intent_config, resolve=True)
+    if intent_config is None:
+        intent_config = {}
+    if not isinstance(intent_config, dict):
+        raise ValueError(f"`intent_config` must resolve to a dict, got {type(intent_config)}")
 
     if isinstance(video_dit_config, DictConfig):
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
@@ -311,6 +319,7 @@ def create_fastwam_dino(
 
     return FastWAM_DINO.from_config(
         dino_config=dino_config,
+        intent_config=intent_config,
         video_dit_config=video_dit_config,
         action_dit_config=action_dit_config,
         device=device,

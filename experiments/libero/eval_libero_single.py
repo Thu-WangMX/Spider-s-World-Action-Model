@@ -198,7 +198,7 @@ def _normalize_proprio(
     return state_batch["state"][state_key]
 
 
-def _obs_to_model_input(
+def _obs_to_model_image(
     obs: dict,
     cfg: DictConfig,
     processor: FastWAMProcessor,
@@ -253,6 +253,27 @@ def _obs_to_model_input(
     x = torch.tensor(rgb).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype)
     x = x * (2.0 / 255.0) - 1.0
 
+    return x, imgs
+
+
+def _obs_to_model_input(
+    obs: dict,
+    cfg: DictConfig,
+    processor: FastWAMProcessor,
+    width: int,
+    height: int,
+    device: str,
+    dtype: torch.dtype,
+):
+    x, imgs = _obs_to_model_image(
+        obs,
+        cfg=cfg,
+        processor=processor,
+        width=width,
+        height=height,
+        device=device,
+        dtype=dtype,
+    )
     proprio = _normalize_proprio(_extract_sim_state(obs), processor)
 
     return x, proprio, imgs
@@ -326,6 +347,30 @@ def _get_future_frame_capture_steps(cfg: DictConfig) -> list[int]:
     return [step_idx * action_video_freq_ratio for step_idx in range(num_future_frames + 1)]
 
 
+def _model_uses_history_intent(model: torch.nn.Module) -> bool:
+    return getattr(model, "intent_encoder", None) is not None
+
+
+def _get_history_frame_offsets(model: torch.nn.Module) -> list[int]:
+    intent_config = getattr(model, "intent_config", None) or {}
+    offsets = intent_config.get(
+        "history_offsets",
+        intent_config.get("history_dino_frame_offsets", [-8, -4, 0]),
+    )
+    return [int(offset) for offset in offsets]
+
+
+def _select_history_video(history_frames: list[torch.Tensor], offsets: list[int]) -> torch.Tensor:
+    if len(history_frames) == 0:
+        raise ValueError("Cannot build history video from an empty frame buffer.")
+    selected = []
+    latest_idx = len(history_frames) - 1
+    for offset in offsets:
+        frame_idx = max(0, min(latest_idx, latest_idx + int(offset)))
+        selected.append(history_frames[frame_idx])
+    return torch.stack(selected, dim=0)
+
+
 def _frame_to_rgb_array(frame: Any) -> np.ndarray:
     if isinstance(frame, dict):
         images = []
@@ -384,6 +429,7 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    history_video: Optional[torch.Tensor] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
@@ -420,6 +466,8 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    if history_video is not None:
+        infer_kwargs["history_video"] = history_video
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -493,6 +541,10 @@ def run_single_episode(
     current_predicted_future_clip: Optional[dict[str, Any]] = None
     current_replan_step = 0
     current_replan_idx = -1
+    use_history_intent = _model_uses_history_intent(model)
+    history_offsets = _get_history_frame_offsets(model) if use_history_intent else []
+    max_history_frames = 1 + max([max(0, -int(offset)) for offset in history_offsets], default=0)
+    history_frames: list[torch.Tensor] = []
 
     t = 0
     done = False
@@ -504,7 +556,26 @@ def run_single_episode(
             t += 1
             continue
 
+        if use_history_intent:
+            history_image, _ = _obs_to_model_image(
+                obs,
+                cfg=cfg,
+                processor=processor,
+                width=input_w,
+                height=input_h,
+                device=model_device,
+                dtype=model.torch_dtype,
+            )
+            history_frames.append(history_image.squeeze(0).detach().clone())
+            if len(history_frames) > max_history_frames:
+                del history_frames[: len(history_frames) - max_history_frames]
+
         if len(pending_actions) == 0:
+            history_video = (
+                _select_history_video(history_frames, history_offsets)
+                if use_history_intent
+                else None
+            )
             action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
                 obs=obs,
                 task_description=task_description,
@@ -515,6 +586,7 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
+                history_video=history_video,
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1

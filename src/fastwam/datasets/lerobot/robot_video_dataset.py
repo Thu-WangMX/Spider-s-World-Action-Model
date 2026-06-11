@@ -47,6 +47,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         dino_latent_cache_dir: Optional[str] = None,
         dino_latent_cache_mode: str = "window",
         dino_latent_cache_required: bool = False,
+        load_history_dino_latents: bool = False,
+        history_dino_frame_offsets: Optional[list[int]] = None,
+        history_dino_latent_cache_required: Optional[bool] = None,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -85,6 +88,26 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 f"`dino_latent_cache_mode` must be 'window', 'frame', or 'frame_mmap', got {dino_latent_cache_mode}"
             )
         self.dino_latent_cache_required = dino_latent_cache_required
+        self.load_history_dino_latents = bool(load_history_dino_latents)
+        if history_dino_frame_offsets is None:
+            history_dino_frame_offsets = [-8, -4, 0]
+        self.history_dino_frame_offsets = [int(offset) for offset in history_dino_frame_offsets]
+        if self.load_history_dino_latents and len(self.history_dino_frame_offsets) == 0:
+            raise ValueError(
+                "`history_dino_frame_offsets` must contain at least one offset when "
+                "`load_history_dino_latents=true`."
+            )
+        self.history_dino_latent_cache_required = (
+            bool(dino_latent_cache_required)
+            if history_dino_latent_cache_required is None
+            else bool(history_dino_latent_cache_required)
+        )
+        if self.load_history_dino_latents and self.dino_latent_cache_mode == "window":
+            raise ValueError(
+                "`load_history_dino_latents=true` requires dino_latent_cache_mode='frame' "
+                "or 'frame_mmap'. Window caches contain the prediction window, not arbitrary "
+                "past frames."
+            )
         self._dino_frame_mmap = None
         self._dino_frame_mmap_path = None
         self._dino_frame_mmap_np_dtype = None
@@ -140,15 +163,21 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             return None
         return os.path.join(str(self.dino_latent_cache_dir), "frames", f"{int(idx):08d}.pt")
 
-    def _get_video_global_indices(self, idx: int) -> list[int]:
+    def _get_global_indices_for_offsets(self, idx: int, offsets: list[int]) -> list[int]:
         episode_to = self.lerobot_dataset.episode_data_index["to"]
         episode_idx = int(torch.searchsorted(episode_to, torch.tensor(int(idx)), right=True).item())
         episode_start = int(self.lerobot_dataset.episode_data_index["from"][episode_idx].item())
         episode_end = int(self.lerobot_dataset.episode_data_index["to"][episode_idx].item())
         return [
             max(episode_start, min(episode_end - 1, int(idx) + int(offset)))
-            for offset in self.video_sample_indices
+            for offset in offsets
         ]
+
+    def _get_video_global_indices(self, idx: int) -> list[int]:
+        return self._get_global_indices_for_offsets(idx, self.video_sample_indices)
+
+    def _get_history_dino_global_indices(self, idx: int) -> list[int]:
+        return self._get_global_indices_for_offsets(idx, self.history_dino_frame_offsets)
 
     def _load_cached_dino_latents(self, idx: int) -> Optional[torch.Tensor]:
         if self.dino_latent_cache_mode == "frame":
@@ -186,6 +215,18 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
     def _load_cached_dino_frame_latents(self, idx: int) -> Optional[torch.Tensor]:
         frame_indices = self._get_video_global_indices(idx)
+        return self._load_cached_dino_frame_latents_for_indices(
+            frame_indices,
+            idx_for_error=idx,
+            required=self.dino_latent_cache_required,
+        )
+
+    def _load_cached_dino_frame_latents_for_indices(
+        self,
+        frame_indices: list[int],
+        idx_for_error: int,
+        required: bool,
+    ) -> Optional[torch.Tensor]:
         latents = []
         missing_paths = []
         for frame_idx in frame_indices:
@@ -208,10 +249,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             latents.append(latent.contiguous())
 
         if missing_paths:
-            if self.dino_latent_cache_required:
+            if required:
                 preview = ", ".join(missing_paths[:3])
                 raise FileNotFoundError(
-                    f"Missing {len(missing_paths)} DINO frame cache files for dataset idx={idx}: {preview}. "
+                    f"Missing {len(missing_paths)} DINO frame cache files for dataset idx={idx_for_error}: {preview}. "
                     "Run scripts/precompute_dino_latents.py with dino_latent_cache_mode=frame first."
                 )
             return None
@@ -276,16 +317,23 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         )
 
     def _load_cached_dino_frame_mmap_latents(self, idx: int) -> Optional[torch.Tensor]:
+        frame_indices = self._get_video_global_indices(idx)
+        return self._load_cached_dino_frame_mmap_latents_for_indices(frame_indices, idx_for_error=idx)
+
+    def _load_cached_dino_frame_mmap_latents_for_indices(
+        self,
+        frame_indices: list[int],
+        idx_for_error: int,
+    ) -> Optional[torch.Tensor]:
         self._open_dino_frame_mmap()
         if self._dino_frame_mmap is None:
             return None
 
-        frame_indices = self._get_video_global_indices(idx)
         total_frames = int(self._dino_frame_mmap_shape[0])
         invalid = [frame_idx for frame_idx in frame_indices if frame_idx < 0 or frame_idx >= total_frames]
         if invalid:
             raise IndexError(
-                f"DINO frame mmap index out of bounds for dataset idx={idx}: "
+                f"DINO frame mmap index out of bounds for dataset idx={idx_for_error}: "
                 f"indices={invalid[:3]}, total_frames={total_frames}"
             )
 
@@ -300,6 +348,32 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 f"from {self._dino_frame_mmap_path}"
             )
         return latent.permute(1, 0, 2, 3).contiguous()  # [D, T, H, W]
+
+    def _load_cached_history_dino_latents(self, idx: int) -> Optional[torch.Tensor]:
+        if not self.load_history_dino_latents:
+            return None
+        frame_indices = self._get_history_dino_global_indices(idx)
+        if self.dino_latent_cache_mode == "frame":
+            history = self._load_cached_dino_frame_latents_for_indices(
+                frame_indices,
+                idx_for_error=idx,
+                required=self.history_dino_latent_cache_required,
+            )
+        elif self.dino_latent_cache_mode == "frame_mmap":
+            history = self._load_cached_dino_frame_mmap_latents_for_indices(
+                frame_indices,
+                idx_for_error=idx,
+            )
+        else:
+            raise ValueError(
+                "`load_history_dino_latents=true` only supports frame/frame_mmap DINO caches."
+            )
+        if history is None and self.history_dino_latent_cache_required:
+            raise FileNotFoundError(
+                f"Missing history DINO latents for dataset idx={idx}, "
+                f"frame_indices={frame_indices}, cache_dir={self.dino_latent_cache_dir}"
+            )
+        return history
 
     def _get(self, idx):
         sample_idx = idx
@@ -434,6 +508,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     f"cache T={dino_latents.shape[1]}, video T={video.shape[1]}"
                 )
             data["dino_latents"] = dino_latents
+        history_dino_latents = self._load_cached_history_dino_latents(resolved_sample_idx)
+        if history_dino_latents is not None:
+            expected_t = len(self.history_dino_frame_offsets)
+            if history_dino_latents.shape[1] != expected_t:
+                raise ValueError(
+                    f"History DINO latent temporal length mismatch for idx={resolved_sample_idx}: "
+                    f"cache T={history_dino_latents.shape[1]}, expected T={expected_t}"
+                )
+            data["history_dino_latents"] = history_dino_latents
         return data
 
     def _get_cached_text_context(self, prompt: str):
