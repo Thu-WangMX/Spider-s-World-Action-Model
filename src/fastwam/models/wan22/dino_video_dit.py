@@ -380,15 +380,42 @@ class DinoVideoDiT(nn.Module):
         video_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        video_prefix_len: int = 0,
     ) -> torch.Tensor:
         """Build attention mask for video self-attention within MoT."""
         if video_seq_len <= 0:
             raise ValueError(f"`video_seq_len` must be positive, got {video_seq_len}")
         if video_tokens_per_frame <= 0:
             raise ValueError(f"`video_tokens_per_frame` must be positive, got {video_tokens_per_frame}")
+        video_prefix_len = int(video_prefix_len)
+        if video_prefix_len < 0:
+            raise ValueError(f"`video_prefix_len` must be non-negative, got {video_prefix_len}")
+        if video_prefix_len > video_seq_len:
+            raise ValueError(
+                f"`video_prefix_len` cannot exceed `video_seq_len`, got "
+                f"{video_prefix_len} and {video_seq_len}"
+            )
 
         if self.video_attention_mask_mode == "bidirectional":
             return torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
+
+        if video_prefix_len:
+            original_seq_len = video_seq_len - video_prefix_len
+            if original_seq_len <= 0:
+                raise ValueError("Video prefix cannot consume the entire video sequence.")
+            original_mask = self.build_video_to_video_mask(
+                video_seq_len=original_seq_len,
+                video_tokens_per_frame=video_tokens_per_frame,
+                device=device,
+                video_prefix_len=0,
+            )
+            mask = torch.zeros((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
+            mask[:video_prefix_len, :video_prefix_len] = True
+            first_frame_end = video_prefix_len + min(video_tokens_per_frame, original_seq_len)
+            mask[:video_prefix_len, video_prefix_len:first_frame_end] = True
+            mask[video_prefix_len:, :video_prefix_len] = True
+            mask[video_prefix_len:, video_prefix_len:] = original_mask
+            return mask
 
         if self.video_attention_mask_mode == "per_frame_causal":
             if video_seq_len % video_tokens_per_frame != 0:
@@ -411,6 +438,99 @@ class DinoVideoDiT(nn.Module):
             return video_mask
 
         raise ValueError(f"Unsupported video attention mask mode: {self.video_attention_mask_mode}")
+
+    def _zero_time_modulation(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        zero_steps = torch.zeros((batch_size * seq_len,), dtype=dtype, device=device)
+        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, zero_steps))
+        t = t.reshape(batch_size, seq_len, self.hidden_dim)
+        t_mod = self.time_projection(t).unflatten(2, (6, self.hidden_dim))
+        return t, t_mod
+
+    def prepend_video_prefix_tokens(
+        self,
+        pre_state: Dict[str, Any],
+        prefix_tokens: Optional[torch.Tensor],
+    ) -> Dict[str, Any]:
+        """Prepend text-space condition tokens to the VideoDiT token sequence.
+
+        The prefix is added after DINO grid patchification, so it never changes
+        the stored grid metadata used by `post_dit` and video-loss targets.
+        """
+        if prefix_tokens is None:
+            return pre_state
+        if prefix_tokens.ndim != 3:
+            raise ValueError(
+                f"`prefix_tokens` must be 3D [B,K,D], got shape {tuple(prefix_tokens.shape)}"
+            )
+
+        tokens = pre_state["tokens"]
+        batch_size, _, hidden_dim = tokens.shape
+        if prefix_tokens.shape[0] != batch_size:
+            raise ValueError(
+                f"Batch mismatch between video tokens and prefix tokens: "
+                f"{batch_size} vs {prefix_tokens.shape[0]}"
+            )
+        if prefix_tokens.shape[2] != self.text_dim:
+            raise ValueError(
+                f"Video prefix token dim must match text_dim={self.text_dim}, "
+                f"got {prefix_tokens.shape[2]}"
+            )
+
+        prefix_len = int(prefix_tokens.shape[1])
+        if prefix_len == 0:
+            return pre_state
+        prefix_emb = self.text_embedding(
+            prefix_tokens.to(device=tokens.device, dtype=tokens.dtype)
+        )
+        if prefix_emb.shape[2] != hidden_dim:
+            raise ValueError(
+                f"Projected prefix hidden dim mismatch: {prefix_emb.shape[2]} vs {hidden_dim}"
+            )
+
+        freqs = pre_state["freqs"]
+        prefix_freqs = torch.ones(
+            (prefix_len, 1, freqs.shape[-1]),
+            device=freqs.device,
+            dtype=freqs.dtype,
+        )
+
+        t_mod = pre_state["t_mod"]
+        _, prefix_t_mod = self._zero_time_modulation(
+            batch_size=batch_size,
+            seq_len=prefix_len,
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
+        if t_mod.ndim == 4:
+            new_t_mod = torch.cat([prefix_t_mod.to(dtype=t_mod.dtype), t_mod], dim=1)
+        elif t_mod.ndim == 3:
+            expanded_t_mod = t_mod.unsqueeze(1).expand(
+                -1, tokens.shape[1], -1, -1
+            )
+            new_t_mod = torch.cat(
+                [prefix_t_mod.to(dtype=t_mod.dtype), expanded_t_mod],
+                dim=1,
+            )
+        else:
+            raise ValueError(f"Unexpected `t_mod` shape {tuple(t_mod.shape)}")
+
+        context_mask = pre_state["context_mask"]
+        prefix_context_mask = context_mask[:, :1, :].expand(-1, prefix_len, -1)
+
+        pre_state = dict(pre_state)
+        pre_state["tokens"] = torch.cat([prefix_emb, tokens], dim=1)
+        pre_state["freqs"] = torch.cat([prefix_freqs, freqs], dim=0)
+        pre_state["t_mod"] = new_t_mod
+        pre_state["context_mask"] = torch.cat([prefix_context_mask, context_mask], dim=1)
+        pre_state["meta"] = dict(pre_state["meta"])
+        pre_state["meta"]["video_prefix_len"] = prefix_len
+        return pre_state
 
     def patchify(self, x: torch.Tensor) -> torch.Tensor:
         """Convert DINO latents to DiT tokens.
@@ -744,6 +864,14 @@ class DinoVideoDiT(nn.Module):
         Returns:
             [B, D_dino, T, H_grid, W_grid] predicted velocity in DINO space.
         """
+        prefix_len = int(pre_state.get("meta", {}).get("video_prefix_len", 0))
+        if prefix_len:
+            if x_tokens.shape[1] <= prefix_len:
+                raise ValueError(
+                    f"Cannot strip video prefix of length {prefix_len} from "
+                    f"token sequence length {x_tokens.shape[1]}."
+                )
+            x_tokens = x_tokens[:, prefix_len:]
         grid_size = pre_state["meta"]["grid_size"]
 
         # Apply output head: [B, seq_len, hidden_dim] → configured DINO output space.

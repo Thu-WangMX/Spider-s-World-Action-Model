@@ -31,6 +31,8 @@ from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
 
+INTENT_INJECTION_MODES = {"context_after_proprio", "video_prefix"}
+
 
 class FastWAM_DINO(nn.Module):
     """FastWAM variant with DINO feature space for video representation.
@@ -86,6 +88,16 @@ class FastWAM_DINO(nn.Module):
         self.dino_encoder = dino_encoder
         self.intent_encoder = intent_encoder
         self.intent_config = dict(intent_config or {})
+        self.intent_injection_mode = str(
+            self.intent_config.get("injection_mode", "context_after_proprio")
+        )
+        if self.intent_injection_mode not in INTENT_INJECTION_MODES:
+            raise ValueError(
+                f"Unsupported `intent_config.injection_mode={self.intent_injection_mode!r}`. "
+                f"Expected one of {sorted(INTENT_INJECTION_MODES)}."
+            )
+        if self.intent_encoder is not None:
+            self.intent_config["injection_mode"] = self.intent_injection_mode
         history_offsets = self.intent_config.get("history_offsets", None)
         self.intent_history_frame_count = (
             len(history_offsets)
@@ -308,6 +320,13 @@ class FastWAM_DINO(nn.Module):
         intent_config = dict(intent_config or {})
         intent_encoder = None
         if bool(intent_config.get("enabled", False)):
+            injection_mode = str(intent_config.get("injection_mode", "context_after_proprio"))
+            if injection_mode not in INTENT_INJECTION_MODES:
+                raise ValueError(
+                    f"Unsupported `intent_config.injection_mode={injection_mode!r}`. "
+                    f"Expected one of {sorted(INTENT_INJECTION_MODES)}."
+                )
+            intent_config["injection_mode"] = injection_mode
             history_offsets = intent_config.get(
                 "history_offsets",
                 intent_config.get("history_dino_frame_offsets", [-8, -4, 0]),
@@ -487,6 +506,15 @@ class FastWAM_DINO(nn.Module):
             torch.cat([context_mask, intent_mask], dim=1),
         )
 
+    def _apply_video_prefix_intent(
+        self,
+        video_pre: dict[str, Any],
+        intent_tokens: Optional[torch.Tensor],
+    ) -> dict[str, Any]:
+        if intent_tokens is None:
+            return video_pre
+        return self.video_expert.prepend_video_prefix_tokens(video_pre, intent_tokens)
+
     def _encode_history_intent(self, history_dino_latents: torch.Tensor) -> torch.Tensor:
         if self.intent_encoder is None:
             raise RuntimeError("Intent encoder is disabled.")
@@ -571,22 +599,32 @@ class FastWAM_DINO(nn.Module):
         action_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        video_prefix_len: int = 0,
     ) -> torch.Tensor:
         """Build attention mask for MoT (video + action)."""
         total_seq_len = video_seq_len + action_seq_len
         mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
+        video_prefix_len = int(video_prefix_len)
 
         # video → video
         mask[:video_seq_len, :video_seq_len] = self.video_expert.build_video_to_video_mask(
             video_seq_len=video_seq_len,
             video_tokens_per_frame=video_tokens_per_frame,
             device=device,
+            video_prefix_len=video_prefix_len,
         )
         # action → action (full visibility)
         mask[video_seq_len:, video_seq_len:] = True
-        # action → first-frame video only
-        first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-        mask[video_seq_len:, :first_frame_tokens] = True
+        # action → video prefix plus original first-frame video.  The prefix is
+        # part of the video branch sequence, not extra ActionDiT cross-attn
+        # context, so this keeps the injection mechanism in mixed attention.
+        if video_prefix_len:
+            mask[video_seq_len:, :video_prefix_len] = True
+        original_video_seq_len = video_seq_len - video_prefix_len
+        first_frame_tokens = min(video_tokens_per_frame, original_video_seq_len)
+        first_frame_start = video_prefix_len
+        first_frame_end = first_frame_start + first_frame_tokens
+        mask[video_seq_len:, first_frame_start:first_frame_end] = True
         return mask
 
     def _compute_video_loss_per_sample(
@@ -649,6 +687,7 @@ class FastWAM_DINO(nn.Module):
         context_mask = sample["context_mask"]
         proprio = sample.get("proprio", None)
         history_dino_latents = sample.get("history_dino_latents", None)
+        video_prefix_tokens = None
 
         if "action" not in sample:
             raise ValueError("`action` is required for training.")
@@ -731,11 +770,16 @@ class FastWAM_DINO(nn.Module):
                     f"{history_dino_latents.shape[0]} vs {batch_size}"
                 )
             intent_tokens = self._encode_history_intent(history_dino_latents)
-            context, context_mask = self._append_intent_to_context(
-                context=context,
-                context_mask=context_mask,
-                intent_tokens=intent_tokens,
-            )
+            if self.intent_injection_mode == "context_after_proprio":
+                context, context_mask = self._append_intent_to_context(
+                    context=context,
+                    context_mask=context_mask,
+                    intent_tokens=intent_tokens,
+                )
+            elif self.intent_injection_mode == "video_prefix":
+                video_prefix_tokens = intent_tokens
+            else:
+                raise RuntimeError(f"Unhandled intent injection mode: {self.intent_injection_mode}")
 
         action = action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         if action_is_pad is not None:
@@ -751,6 +795,7 @@ class FastWAM_DINO(nn.Module):
             "action": action,
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
+            "video_prefix_tokens": video_prefix_tokens,
         }
 
     def training_loss(self, sample: dict, tiled: bool = False) -> tuple[torch.Tensor, dict]:
@@ -771,6 +816,7 @@ class FastWAM_DINO(nn.Module):
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
+        video_prefix_tokens = inputs["video_prefix_tokens"]
 
         # === Video flow matching ===
         noise_video = torch.randn_like(input_latents)
@@ -804,6 +850,7 @@ class FastWAM_DINO(nn.Module):
             context_mask=context_mask,
             fuse_vae_embedding_in_latents=True,  # First frame is clean
         )
+        video_pre = self._apply_video_prefix_intent(video_pre, video_prefix_tokens)
 
         action_pre = self.action_expert.pre_dit(
             action_tokens=noisy_action,
@@ -821,6 +868,7 @@ class FastWAM_DINO(nn.Module):
             action_seq_len=action_tokens.shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_tokens.device,
+            video_prefix_len=int(video_pre["meta"].get("video_prefix_len", 0)),
         )
 
         tokens_out = self.mot(
@@ -1007,6 +1055,7 @@ class FastWAM_DINO(nn.Module):
         first_frame_latents = self._encode_single_frame_dino(input_image)  # [1, D, 1, H_g, W_g]
 
         # Prepare context
+        video_prefix_tokens = None
         use_prompt = prompt is not None
         use_context = context is not None or context_mask is not None
         if use_prompt and use_context:
@@ -1085,11 +1134,16 @@ class FastWAM_DINO(nn.Module):
                 )
 
             intent_tokens = self._encode_history_intent(history_dino_latents)
-            context, context_mask = self._append_intent_to_context(
-                context=context,
-                context_mask=context_mask,
-                intent_tokens=intent_tokens,
-            )
+            if self.intent_injection_mode == "context_after_proprio":
+                context, context_mask = self._append_intent_to_context(
+                    context=context,
+                    context_mask=context_mask,
+                    intent_tokens=intent_tokens,
+                )
+            elif self.intent_injection_mode == "video_prefix":
+                video_prefix_tokens = intent_tokens
+            else:
+                raise RuntimeError(f"Unhandled intent injection mode: {self.intent_injection_mode}")
 
         # Video prefill: encode first frame, cache KV
         timestep_video = torch.zeros(
@@ -1104,6 +1158,7 @@ class FastWAM_DINO(nn.Module):
             context_mask=context_mask,
             fuse_vae_embedding_in_latents=True,
         )
+        video_pre = self._apply_video_prefix_intent(video_pre, video_prefix_tokens)
 
         video_seq_len = int(video_pre["tokens"].shape[1])
         attention_mask = self._build_mot_attention_mask(
@@ -1111,6 +1166,7 @@ class FastWAM_DINO(nn.Module):
             action_seq_len=latents_action.shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
+            video_prefix_len=int(video_pre["meta"].get("video_prefix_len", 0)),
         )
 
         video_kv_cache = self.mot.prefill_video_cache(
@@ -1171,9 +1227,43 @@ class FastWAM_DINO(nn.Module):
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
+    def _validate_checkpoint_intent_config(self, checkpoint: dict[str, Any]) -> None:
+        if "intent_encoder" not in checkpoint:
+            return
+        if self.intent_encoder is None:
+            raise ValueError(
+                "Checkpoint contains `intent_encoder`, but this model was built with "
+                "`intent_config.enabled=false` or without intent_config. Rebuild the model "
+                "with the checkpoint's intent_config before evaluation/loading."
+            )
+        checkpoint_config = dict(checkpoint.get("intent_config") or {})
+        checkpoint_mode = str(checkpoint_config.get("injection_mode", "context_after_proprio"))
+        if checkpoint_mode != self.intent_injection_mode:
+            raise ValueError(
+                "Intent injection mode mismatch between checkpoint and current model: "
+                f"checkpoint={checkpoint_mode!r}, current={self.intent_injection_mode!r}."
+            )
+        for key in (
+            "history_offsets",
+            "max_history_frames",
+            "num_intent_tokens",
+            "resampler_dim",
+            "num_resampler_layers",
+            "num_heads",
+            "mlp_ratio",
+        ):
+            if key in checkpoint_config and key in self.intent_config:
+                if checkpoint_config[key] != self.intent_config[key]:
+                    raise ValueError(
+                        f"Intent config mismatch for `{key}`: "
+                        f"checkpoint={checkpoint_config[key]!r}, "
+                        f"current={self.intent_config[key]!r}."
+                    )
+
     def load_checkpoint(self, path, optimizer=None):
         """Load model checkpoint."""
         checkpoint = torch.load(path, map_location="cpu")
+        self._validate_checkpoint_intent_config(checkpoint)
         missing, unexpected = self.mot.load_state_dict(checkpoint["mot"], strict=False)
         if missing or unexpected:
             logger.warning(

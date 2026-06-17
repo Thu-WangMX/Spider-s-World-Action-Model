@@ -401,3 +401,317 @@ history action conditioning
 ```
 
 原因：先把“历史 DINO intent 是否有用”这个问题隔离出来。证明有效之后，再叠更复杂的 memory/VLM。
+
+---
+
+## 8. Short-DINO-Intent video_prefix 注入实现记录
+
+更新时间：2026-06-13
+
+本次在现有 Short-DINO-Intent / context-after-proprio 基础上，新增了严格可选的 `video_prefix` 注入方式：
+
+```text
+history frames [-8, -4, 0]
+-> DINO history tokens
+-> DINOHistoryIntentResampler
+-> K intent tokens
+-> prepend 到 VideoDiT video token sequence
+```
+
+配置开关：
+
+```text
+model.intent_config.enabled=true
+model.intent_config.injection_mode=context_after_proprio | video_prefix
+```
+
+兼容性结论：
+
+- 默认行为保持不变：不配置 `intent_config` 时不启用 intent；启用但不写 `injection_mode` 时默认等价于原来的 `context_after_proprio`。
+- `context_after_proprio` 路径保持旧行为：intent tokens 追加到 text/proprio context 后面，作为 VideoDiT / ActionDiT 的 cross-attention context。
+- `video_prefix` 路径只把 intent tokens prepend 到 VideoDiT video sequence；ActionDiT cross-attention context 不额外拼 intent。
+- checkpoint 保存 `intent_encoder` 和 `intent_config`；加载时如果 checkpoint 有 intent encoder 但当前模型没启用 intent，或者 `injection_mode` 不一致，会直接报错，避免 eval 静默加载错误结构。
+
+当前 `video_prefix` token/mask 设计：
+
+```text
+video branch  = [p, f0, f1..fh]
+action branch = [a1..ah]
+
+p      = Short-DINO-Intent prefix tokens
+f0     = clean first-frame DINO tokens
+f1..fh = 含噪后续 video/DINO tokens
+a1..ah = 含噪 action tokens
+```
+
+训练 attention mask：
+
+```text
+             p      f0     f1..fh   a1..ah
+p          [ ✓ ]   [ ✓ ]   [  ]     [  ]
+f0         [ ✓ ]   [ ✓ ]   [  ]     [  ]
+f1..fh     [ ✓ ]   [ ✓ ]   [ ✓ ]    [  ]
+a1..ah     [ ✓ ]   [ ✓ ]   [  ]     [ ✓ ]
+```
+
+也就是说：
+
+- prefix token 可以看 prefix 自己和 `f0`，不能看含噪后续 video token，避免从 noisy future video 泄漏。
+- `f0` 可以看 prefix 和 `f0`，不能看含噪后续 video token。
+- 含噪后续 video tokens 可以看 prefix、`f0` 和全部 video tokens，用于 video branch dynamics。
+- action tokens 可以看 prefix、`f0` 和全部 action tokens，但不能看含噪后续 video tokens。
+- video tokens 不看 action tokens。
+
+RoPE / position 处理：
+
+- prefix 是 resampler 产出的抽象 intent tokens，不对应真实 DINO 3D grid 位置。
+- 当前实现给 prefix 使用 identity / zero-position RoPE，即 RoPE freqs 全 1；原始 video tokens 的 3D RoPE 完全保持原样。
+- 暂不使用 negative RoPE，因为 history offsets 已经在 intent encoder 的 temporal embedding 中编码，给抽象 prefix 强行分配 `t<0` 的 video grid 位置会引入额外假设。
+
+loss / shape 处理：
+
+- prefix 在 DINO grid patchify 之后 prepend，进入 transformer sequence，不改原始 `[T,H,W]` grid metadata。
+- `post_dit` 前会 strip 掉 prefix tokens，再 unpatchify 回原 DINO grid。
+- video loss 只计算原始 video tokens；prefix 不参与 DINO target，也不参与 video loss。
+- train forward 和 eval / `infer_action` 都使用同一个 `video_prefix` prepend helper，保证训推一致。
+
+本次最小验证：
+
+```text
+python -m py_compile:
+  src/fastwam/models/wan22/dino_video_dit.py
+  src/fastwam/models/wan22/fastwam_dino.py
+  experiments/libero/eval_libero_single.py
+  src/fastwam/trainer.py
+
+git diff --check:
+  src/fastwam/models/wan22/dino_video_dit.py
+  src/fastwam/models/wan22/fastwam_dino.py
+
+Hydra compose:
+  default config without intent_config OK
+  explicit video_prefix intent_config OK
+
+Tiny tensor smoke:
+  context_after_proprio training_loss OK
+  context_after_proprio infer_action OK
+  video_prefix training_loss OK
+  video_prefix infer_action OK
+  checkpoint injection_mode mismatch guard OK
+  explicit attention mask assertions OK
+```
+
+完整训练命令：
+
+```bash
+cd /data73/mingxinwang/Spider-s-World-Action-Model
+
+export PYTHON=/data73/mingxinwang/conda_envs/spiderwam/bin/python
+export RUN_ID=short_dino_intent_video_prefix_10ep_$(date +%Y%m%d_%H%M%S)
+export OUTPUT_DIR=/data32/mingxinwang/Spider-s-World-Action-Model/runs/libero_dino_s_smallvideo_2cam_224_1e-4/${RUN_ID}
+export DINO_CACHE_DIR=/data73/mingxinwang/Spider-s-World-Action-Model/data/dino_latents_cache/libero_dino_s_2cam224_pool1x1_frame_exact_mmap
+
+WAIT_FOR_GPUS=1 RUN_ID="${RUN_ID}" bash scripts/train_zero1.sh 8 \
+  "task=libero_dino_s_smallvideo_2cam_224_1e-4" \
+  "output_dir=${OUTPUT_DIR}" \
+  "wandb.enabled=true" \
+  "wandb.name=${RUN_ID}" \
+  "batch_size=6" \
+  "num_workers=6" \
+  "prefetch_factor=1" \
+  "persistent_workers=true" \
+  "learning_rate=5e-5" \
+  "num_epochs=10" \
+  "max_steps=null" \
+  "gradient_accumulation_steps=2" \
+  "weight_decay=1e-2" \
+  "save_every=2000" \
+  "eval_every=200" \
+  "resume=null" \
+  "model.loss.lambda_video=0.05" \
+  "model.loss.lambda_action=5.0" \
+  "model.dino_config.load_backbone=false" \
+  "model.dino_config.latent_spatial_pool=[1,1]" \
+  "data.train.dino_latent_cache_dir=${DINO_CACHE_DIR}" \
+  "data.train.dino_latent_cache_mode=frame_mmap" \
+  "data.train.dino_latent_cache_required=true" \
+  "+data.train.load_history_dino_latents=true" \
+  "+data.train.history_dino_frame_offsets=[-8,-4,0]" \
+  "+model.intent_config.enabled=true" \
+  "+model.intent_config.injection_mode=video_prefix" \
+  "+model.intent_config.history_offsets=[-8,-4,0]" \
+  "+model.intent_config.max_history_frames=3" \
+  "+model.intent_config.num_intent_tokens=8" \
+  "+model.intent_config.resampler_dim=1024" \
+  "+model.intent_config.num_resampler_layers=2" \
+  "+model.intent_config.num_heads=8" \
+  "+model.intent_config.mlp_ratio=4.0" \
+  "+model.intent_config.dropout=0.0"
+```
+
+说明：
+
+- 这条命令是 8 GPU、`batch_size=6`、`gradient_accumulation_steps=2`，global batch size 为 `96`，对齐当前 DINO no-pool / Short-DINO-Intent 的主要对照设置。
+- `data.train.dino_latent_cache_mode` 已经存在于当前 config 中，所以这里使用普通 override，不使用 `+data.train.dino_latent_cache_mode=...`。
+- 输出目录放在 `/data32/mingxinwang/...`；当前该目录已有写权限。
+
+## 10. Short-DINO-Intent 评测命令与踩坑记录
+
+### 10.1 重要注意
+
+Short-DINO-Intent / no-pool DINO smallvideo / avgpool DINO smallvideo 的 LIBERO 评测必须使用：
+
+```text
+task=libero_dino_s_smallvideo_2cam_224_1e-4
+```
+
+不要误用：
+
+```text
+task=libero_dino_s_2cam_224_1e-4
+```
+
+原因：
+
+- `libero_dino_s_smallvideo_2cam_224_1e-4` 会加载 `configs/model/fastwam_dino_s_smallvideo.yaml`，这是当前 1B smallvideo DINO / no-pool / avgpool / short-intent 系列使用的正确模型配置。
+- `libero_dino_s_2cam_224_1e-4` 会加载 `configs/model/fastwam_dino_s.yaml`，这不是 smallvideo 路线，且当前这份配置里的 DINO 路径仍可能是旧的 `/data11/wmx/...`，会导致 eval worker 找不到本地 DINO 权重后 fallback 到 `torch.hub` / HuggingFace，离线机器会失败。
+- 之前 avgpool 评测能正常跑，是因为使用了 smallvideo task，`model_path=checkpoints/dinov3_weights/dinov3_vits16_timm_lvd1689m.safetensors` 能在 worker `cd /data73/mingxinwang/Spider-s-World-Action-Model` 后正确解析。
+
+另外，在没有 `python` 命令的机器上，manager 虽然可以用绝对路径启动，但 worker 仍会调用脚本里的 `PYTHON` 环境变量。因此需要显式设置：
+
+```bash
+export PYTHON=/data73/mingxinwang/conda_envs/spiderwam/bin/python3.10
+```
+
+### 10.2 1B Short-DINO-Intent context-after-proprio 评测命令
+
+以下命令用于评测：
+
+```text
+/data32/mingxinwang/Spider-s-World-Action-Model/runs/libero_dino_s_smallvideo_2cam_224_1e-4/short_dino_intent_fromscratch_10ep_auto/checkpoints/weights/step_022000.pt
+```
+
+使用 GPU `2,3,7`，每卡最多 4 个 LIBERO 子任务：
+
+```bash
+cd /data73/mingxinwang/Spider-s-World-Action-Model
+
+export PYTHON=/data73/mingxinwang/conda_envs/spiderwam/bin/python3.10
+export CUDA_VISIBLE_DEVICES=2,3,7
+export LIBERO_ROOT=/data73/mingxinwang/LIBERO
+export PYTHONPATH="${LIBERO_ROOT}:${PYTHONPATH:-}"
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export TOKENIZERS_PARALLELISM=false
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+export MPLCONFIGDIR=/tmp/matplotlib-cache
+export WAIT_FOR_GPUS=0
+
+$PYTHON experiments/libero/run_libero_manager.py \
+  task=libero_dino_s_smallvideo_2cam_224_1e-4 \
+  ckpt=/data32/mingxinwang/Spider-s-World-Action-Model/runs/libero_dino_s_smallvideo_2cam_224_1e-4/short_dino_intent_fromscratch_10ep_auto/checkpoints/weights/step_022000.pt \
+  EVALUATION.num_trials=30 \
+  EVALUATION.output_dir=/data73/mingxinwang/Spider-s-World-Action-Model/evaluate_results/libero/short_dino_intent_30trials_step_022000_3gpu237_mtp4_$(date +%Y%m%d_%H%M%S) \
+  MULTIRUN.num_gpus=3 \
+  MULTIRUN.max_tasks_per_gpu=4 \
+  MULTIRUN.omp_num_threads=2 \
+  MULTIRUN.mkl_num_threads=1 \
+  MULTIRUN.openblas_num_threads=1 \
+  MULTIRUN.numexpr_num_threads=1 \
+  model.dino_config.load_backbone=true \
+  model.dino_config.latent_spatial_pool=[1,1] \
+  +model.intent_config.enabled=true \
+  +model.intent_config.history_offsets=[-8,-4,0] \
+  +model.intent_config.max_history_frames=3 \
+  +model.intent_config.num_intent_tokens=8 \
+  +model.intent_config.resampler_dim=1024 \
+  +model.intent_config.num_resampler_layers=2 \
+  +model.intent_config.num_heads=8 \
+  +model.intent_config.mlp_ratio=4.0 \
+  +model.intent_config.dropout=0.0
+```
+
+说明：
+
+- `model.dino_config.load_backbone=true` 必须开启，因为 LIBERO eval 需要在线编码当前帧和 history frames。
+- `model.dino_config.latent_spatial_pool=[1,1]` 必须覆盖，因为该 checkpoint 是 no-pool DINO latent；task 默认可能是 `[1,2]`。
+- `+model.intent_config.*` 必须带上，否则模型不会构建 `intent_encoder`，checkpoint 中的 intent 权重也不会加载，评测会退化成非 intent 结构。
+- 如果未来在某台机器上 DINO 权重路径解析仍失败，可以额外加：
+
+```bash
+  model.dino_config.model_path=/data73/mingxinwang/Spider-s-World-Action-Model/checkpoints/dinov3_weights/dinov3_vits16_timm_lvd1689m.safetensors \
+```
+
+## 11. Short-DINO-Intent context-after-proprio 当前评测与下一步决策
+
+截至 2026-06-15，当前 1B Short-DINO-Intent / context-after-proprio 的 30-trial LIBERO 评测已经更新进：
+
+```text
+libero_dashboard/dashboard_data.json
+DINO_TOKEN_PROCESSING_COMPARISON.md
+```
+
+评测结果：
+
+| checkpoint | global bs | 等效 epoch | Spatial | Object | Goal | LIBERO-10 | Overall |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `step_022000` | 96 | 7.60 | 92.33 | 100.00 | 95.00 | 75.00 | 90.58 |
+| `step_024000` | 96 | 8.30 | 95.33 | 95.33 | 87.67 | 79.00 | 89.33 |
+| `step_026000` | 96 | 8.99 | 93.00 | 97.67 | 90.67 | 75.00 | 89.08 |
+| `step_028000` | 96 | 9.68 | 92.00 | 99.67 | 90.33 | 77.67 | 89.92 |
+| `step_028930` | 96 | 10.00 | 93.33 | 98.67 | 90.33 | 77.67 | 90.00 |
+
+对比 no-intent DINO no-pool fresh 10ep：
+
+| route | checkpoint | global bs | 等效 epoch | Spatial | Object | Goal | LIBERO-10 | Overall |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| DINO no-pool fresh | `step_028930` | 96 | 10.00 | 98.67 | 99.33 | 92.33 | 84.00 | 93.58 |
+| Short-DINO-Intent context-after-proprio endpoint | `step_028930` | 96 | 10.00 | 93.33 | 98.67 | 90.33 | 77.67 | 90.00 |
+| difference | - | - | - | -5.34 | -0.66 | -2.00 | -6.33 | -3.58 |
+
+当前判断：
+
+- 10ep context-after-proprio 明显没有超过 no-intent no-pool fresh，尤其 LIBERO-10 从 `84.00` 掉到 `77.67`。
+- 不能直接判死，因为它引入了 intent encoder / 新 context 分布，可能需要更充分训练；但继续用本机 8 卡 resume 同一条 context-after-proprio 的信息增量不高。
+- AMD 卡那边已经有 context-after-proprio / 拼接 short intent 的 20ep 训练，明天评测可以回答“是不是只是 10ep 训练不足”。
+- 本机 8 卡更建议今晚启动 `video_prefix` injection ablation：history offsets、K、resampler、loss、global bs、lr 都保持一致，只换注入位置，attribution 最干净。
+
+建议执行顺序：
+
+1. 等 AMD 20ep context-after-proprio eval：如果能明显回到 no-pool 10ep/20ep 附近，再考虑继续加训 context route。
+2. 本机 8 卡先训 `model.intent_config.injection_mode=video_prefix`，完整命令见本文件第 8 节“完整训练命令”。
+3. 后续对比时用同一组指标：`step_022000/024000/026000/028000/028930`，global bs `96`，等效 epoch 对齐。
+
+## 12. video_prefix 当前训练归档注意事项
+
+2026-06-15 检查 `dinointent` tmux 后确认：
+
+```text
+RUN_ID=short_dino_intent_video_prefix_10ep_20260614_083209
+run_dir=/data32/mingxinwang/Spider-s-World-Action-Model/runs/libero_dino_s_smallvideo_2cam_224_1e-4/short_dino_intent_video_prefix_10ep_20260614_083209
+resume=/data32/mingxinwang/Spider-s-World-Action-Model/runs/libero_dino_s_smallvideo_2cam_224_1e-4/short_dino_intent_video_prefix_10ep_20260614_083209/checkpoints/state/step_006000
+```
+
+这个 run 不是 context-after-proprio 拼接版，而是 `video_prefix` 版：
+
+```yaml
+model.intent_config.enabled: true
+model.intent_config.injection_mode: video_prefix
+model.intent_config.history_offsets: [-8, -4, 0]
+model.intent_config.num_intent_tokens: 8
+data.train.load_history_dino_latents: true
+data.train.history_dino_frame_offsets: [-8, -4, 0]
+```
+
+重要归档点：
+
+- 这条线最早是在 `2026-06-14` 启动的 `video_prefix` run，中途被误以为是拼接版 intent 而 `C-c` 掉。
+- 2026-06-15 重新启动 guard 时，tmux 环境里已有 `RUN_ID=short_dino_intent_video_prefix_10ep_20260614_083209`，所以 guard 正确进入同一个 `/data32` run 目录，并从最近完整 state `step_006000` 做 full-state resume。
+- 虽然后续 resume 命令和新写出的 `config.yaml` 里显示 `learning_rate: 0.0001`，但 full-state resume 会恢复 optimizer/scheduler；日志中实际 LR 为 `lr=4.67e-05`，说明它实际延续的是原 `5e-5 cosine` 训练线，而不是 fresh `1e-4` 从零训练。
+- 后续评测/leaderboard 命名不要写成 `video_prefix lr1e-4 fresh`。更准确写法是：
+
+```text
+Short-DINO-Intent video_prefix, lr5e-5 cosine, full resume from step_006000, run_id=short_dino_intent_video_prefix_10ep_20260614_083209
+```
+
+如果未来要做真正 fresh `1e-4` video_prefix 对照，需要新建不同 `RUN_ID`，且确保 `resume=null`，不要复用这个 run 目录。

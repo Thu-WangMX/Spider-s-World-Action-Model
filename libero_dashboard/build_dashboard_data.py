@@ -378,6 +378,21 @@ MANUAL_NOTES: list[tuple[str, dict[str, Any]]] = [
         },
     ),
     (
+        "short_dino_intent_30trials_step_",
+        {
+            "valid": True,
+            "resume_type": "fresh Short-DINO-Intent context-after-proprio train",
+            "learning_rate": "5e-5 cosine",
+            "global_batch": 96,
+            "pooling": "none [1,1]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S small-video + Short-DINO-Intent",
+            "wan_init": "false",
+            "variant": "Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8, fresh 10ep",
+        },
+    ),
+    (
         "nopool_step026000_30trials",
         {
             "valid": True,
