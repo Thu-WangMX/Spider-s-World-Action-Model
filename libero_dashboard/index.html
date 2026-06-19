@@ -160,6 +160,18 @@
       background: #fbfcfe;
     }
 
+    .panel-actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .panel-actions select {
+      max-width: 420px;
+    }
+
     .panel-title {
       font-size: 15px;
       font-weight: 760;
@@ -397,8 +409,15 @@
         <div>
           <div class="panel-title">全部评测记录</div>
           <div class="detail">自动扫描 evaluate_results/**/summary.json；最左侧时间来自 summary.json 文件生成/修改时间；展示顺序按时间从旧到新排序，越新的评测记录越靠下。</div>
+          <div class="detail" id="variantFilterNote">当前展示全部变体；可选择单一变体查看不同 step / epoch 的评测记录。</div>
         </div>
-        <span class="badge plain" id="evalCount">0 rows</span>
+        <div class="panel-actions">
+          <select id="variantFilter" title="只看同一变体的不同 step / epoch">
+            <option value="">全部变体</option>
+          </select>
+          <button id="clearVariantFilter" type="button">显示全部变体</button>
+          <span class="badge plain" id="evalCount">0 rows</span>
+        </div>
       </div>
       <div class="table-wrap">
         <table>
@@ -483,11 +502,19 @@
 
     let dashboard = null;
     let validOnly = true;
+    let selectedVariant = "";
     let dataSignature = "";
 
     const $ = (id) => document.getElementById(id);
     const pct = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : "-";
     const shortPath = (s) => s ? s.replace(/^.*Spider-s-World-Action-Model\//, "") : "-";
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    }[c]));
 
     function clsScore(v) {
       if (!Number.isFinite(Number(v))) return "";
@@ -499,6 +526,16 @@
     function selectedEvals() {
       const evals = dashboard ? dashboard.evals : [];
       return validOnly ? evals.filter(e => e.meta.valid !== false) : evals;
+    }
+
+    function variantOf(e) {
+      return e?.meta?.variant && e.meta.variant !== "unknown" ? e.meta.variant : "unknown";
+    }
+
+    function tableEvals() {
+      const evals = selectedEvals();
+      if (!selectedVariant) return evals;
+      return evals.filter(e => variantOf(e) === selectedVariant);
     }
 
     function signatureOf(data) {
@@ -536,7 +573,8 @@
         metric("最新有效评测", latestValid ? `${pct(latestValid.overall)}%` : "-", latestValid ? latestValid.id : "-"),
         metric("最新权重", dashboard.training_state?.latest_weight_step ?? "-", dashboard.training_state?.run_dir ?? "-")
       ].join("");
-      renderTable(evals);
+      renderVariantFilter(evals);
+      renderTable(tableEvals(), evals.length);
       renderTrend(evals);
       renderBadcaseSelect();
       if (!options.preserveBadcases) {
@@ -576,8 +614,39 @@
       return parts.join("; ");
     }
 
-    function renderTable(evals) {
-      $("evalCount").textContent = `${evals.length} rows`;
+    function renderVariantFilter(evals) {
+      const select = $("variantFilter");
+      const current = selectedVariant;
+      const counts = new Map();
+      evals.forEach(e => {
+        const variant = variantOf(e);
+        counts.set(variant, (counts.get(variant) || 0) + 1);
+      });
+      const variants = [...counts.keys()].sort((a, b) => {
+        const byCount = counts.get(b) - counts.get(a);
+        return byCount || a.localeCompare(b);
+      });
+      select.innerHTML = [
+        `<option value="">全部变体 (${evals.length})</option>`,
+        ...variants.map(v => `<option value="${esc(v)}">${esc(v)} (${counts.get(v)})</option>`)
+      ].join("");
+      if (current && counts.has(current)) {
+        selectedVariant = current;
+        select.value = current;
+      } else {
+        selectedVariant = "";
+        select.value = "";
+      }
+      $("clearVariantFilter").disabled = !selectedVariant;
+      $("variantFilterNote").textContent = selectedVariant
+        ? `当前只展示变体：${selectedVariant}，用于横向比较该变体不同 step / epoch。`
+        : "当前展示全部变体；可选择单一变体查看不同 step / epoch 的评测记录。";
+    }
+
+    function renderTable(evals, totalRows = evals.length) {
+      $("evalCount").textContent = selectedVariant
+        ? `${evals.length} / ${totalRows} rows`
+        : `${evals.length} rows`;
       $("evalRows").innerHTML = evals.map(e => {
         const status = e.meta.valid === false
           ? `<span class="badge invalid" title="${e.meta.warning || ""}">invalid</span>`
@@ -739,6 +808,14 @@
       validOnly = false;
       $("showAll").classList.add("active");
       $("validOnly").classList.remove("active");
+      render();
+    });
+    $("variantFilter").addEventListener("change", () => {
+      selectedVariant = $("variantFilter").value;
+      render();
+    });
+    $("clearVariantFilter").addEventListener("click", () => {
+      selectedVariant = "";
       render();
     });
     $("refresh").addEventListener("click", () => loadData({ auto: false }));

@@ -37,6 +37,7 @@ for path in (libero_root, project_src, project_root):
 
 from experiments.libero.libero_utils import (
     LIBERO_ENV_RESOLUTION,
+    as_uint8_rgb_image,
     get_libero_dummy_action,
     get_libero_env,
     get_libero_image,
@@ -170,6 +171,7 @@ def _filter_call_kwargs(fn, kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarray:
+    image = as_uint8_rgb_image(image)
     pil_image = Image.fromarray(image)
     src_w, src_h = pil_image.size
     scale = max(width / src_w, height / src_h)

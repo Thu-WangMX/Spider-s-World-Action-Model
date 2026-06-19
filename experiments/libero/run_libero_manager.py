@@ -38,6 +38,11 @@ def create_task_file(output_file: Path, task_suite_names: list[str]) -> Path:
     return output_file
 
 
+def count_task_file_entries(task_file: Path) -> int:
+    with task_file.open("r", encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
+
+
 def _is_blocked_override(raw_override: str) -> bool:
     key = raw_override.split("=", 1)[0].lstrip("+~")
     blocked_exact = {
@@ -158,6 +163,14 @@ def main(cfg: DictConfig):
     else:
         task_file = output_dir / "tasks.txt"
     task_file = create_task_file(task_file, list(manager.task_suite_names))
+    expected_num_tasks = manager.get("expected_num_tasks")
+    if expected_num_tasks is not None:
+        actual_num_tasks = count_task_file_entries(task_file)
+        if actual_num_tasks != int(expected_num_tasks):
+            raise ValueError(
+                f"Task list has {actual_num_tasks} tasks, expected {expected_num_tasks}. "
+                "Check LIBERO_ROOT/PYTHONPATH; LIBERO-plus full eval should create 10030 tasks."
+            )
 
     OmegaConf.save(config=cfg, f=str(output_dir / "manager_config.yaml"))
 

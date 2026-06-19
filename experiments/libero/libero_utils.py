@@ -22,6 +22,34 @@ DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 
+def as_uint8_rgb_image(image):
+    image = np.asarray(image)
+
+    if image.ndim == 2:
+        image = image[..., None]
+    if image.ndim != 3:
+        raise ValueError(f"Expected image with shape [H,W,C] or [H,W], got {image.shape}")
+
+    channels = image.shape[-1]
+    if channels == 1:
+        image = np.repeat(image, 3, axis=-1)
+    elif channels == 4:
+        image = image[..., :3]
+    elif channels != 3:
+        raise ValueError(f"Expected image with 1, 3, or 4 channels, got shape {image.shape}")
+
+    if image.dtype == np.uint8:
+        return np.ascontiguousarray(image)
+
+    if np.issubdtype(image.dtype, np.floating):
+        finite = image[np.isfinite(image)]
+        max_value = float(finite.max()) if finite.size else 0.0
+        if max_value <= 1.0:
+            image = image * 255.0
+        image = np.nan_to_num(image, nan=0.0, posinf=255.0, neginf=0.0)
+    return np.ascontiguousarray(np.clip(image, 0, 255).astype(np.uint8))
+
+
 def get_libero_env(task, resolution, seed, env_num=1):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
@@ -72,6 +100,7 @@ def save_rollout_video(rollout_dir, rollout_images, idx, success, task_descripti
             image = []
             for key, value in img.items():
                 value_array = np.array(value) if isinstance(value, Image.Image) else value.copy()
+                value_array = as_uint8_rgb_image(value_array)
                 pil_img = Image.fromarray(value_array)
                 draw = ImageDraw.Draw(pil_img)
                 draw.text((10, 10), f"{key}", fill=(255, 255, 255))
@@ -80,7 +109,7 @@ def save_rollout_video(rollout_dir, rollout_images, idx, success, task_descripti
         elif isinstance(img, Image.Image):
             frame = np.array(img.convert("RGB"))
         else:
-            frame = np.array(img)
+            frame = as_uint8_rgb_image(img)
         video_writer.append_data(frame)
     video_writer.close()
     print(f"Saved rollout MP4 at path {mp4_path}")
@@ -111,17 +140,17 @@ def save_prediction_video(
             gt_images = []
             for value in gt_frame.values():
                 value_array = np.array(value) if isinstance(value, Image.Image) else value.copy()
-                gt_images.append(value_array)
+                gt_images.append(as_uint8_rgb_image(value_array))
             gt_image = np.concatenate(gt_images, axis=1)
         elif isinstance(gt_frame, Image.Image):
             gt_image = np.array(gt_frame.convert("RGB"))
         else:
-            gt_image = np.array(gt_frame)
+            gt_image = as_uint8_rgb_image(gt_frame)
 
         if isinstance(pred_frame, Image.Image):
             pred_image = np.array(pred_frame.convert("RGB"))
         else:
-            pred_image = np.array(pred_frame)
+            pred_image = as_uint8_rgb_image(pred_frame)
 
         target_h, target_w = pred_image.shape[:2]
         if gt_image.shape[:2] != (target_h, target_w):

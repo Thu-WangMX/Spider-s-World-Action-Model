@@ -652,6 +652,14 @@ run_libero_eval() {
     # Run the result summarization script
     echo "Generating evaluation report..."
     "$PYTHON_BIN" experiments/libero/summarize_results.py --output_dir="$OUTPUT_DIR"
+    if [ "${LIBERO_PLUS_SUMMARY:-0}" = "1" ]; then
+        echo "Generating LIBERO-plus perturbation-category report..."
+        plus_summary_args=(--output_dir "$OUTPUT_DIR")
+        if [ -n "${LIBERO_PLUS_CLASSIFICATION_PATH:-}" ]; then
+            plus_summary_args+=(--classification_path "$LIBERO_PLUS_CLASSIFICATION_PATH")
+        fi
+        "$PYTHON_BIN" experiments/libero/summarize_libero_plus_results.py "${plus_summary_args[@]}"
+    fi
 }
 
 

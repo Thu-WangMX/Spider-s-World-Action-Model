@@ -378,6 +378,101 @@ MANUAL_NOTES: list[tuple[str, dict[str, Any]]] = [
         },
     ),
     (
+        "aihub_1b_smallvideo_context_intent_30trials_step_",
+        {
+            "valid": True,
+            "resume_type": "fresh Short-DINO-Intent context-after-proprio train on AMD",
+            "learning_rate": "1e-4 cosine",
+            "global_batch": 96,
+            "pooling": "none [1,1]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S small-video + Short-DINO-Intent",
+            "wan_init": "false",
+            "variant": "AIHub/AMD 1B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is the 20ep endpoint",
+            "manual_endpoint_step": 10860,
+            "manual_endpoint_epoch": 20.0,
+        },
+    ),
+    (
+        "aihub_1b_smallvideo_context_intent_30trials_step_010860",
+        {
+            "manual_epoch": 20.0,
+            "variant": "AIHub/AMD 1B Short-DINO-Intent context-after-proprio, 20ep endpoint, history offsets [-8,-4,0], K=8",
+        },
+    ),
+    (
+        "short_dino_intent_video_prefix_10ep_30trials_step_",
+        {
+            "valid": True,
+            "resume_type": "fresh Short-DINO-Intent video-prefix train on local 8xGPU",
+            "learning_rate": "5e-5 cosine (configured run, despite script name mentioning lr1e-4)",
+            "global_batch": 96,
+            "pooling": "none [1,1]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S small-video + Short-DINO-Intent",
+            "wan_init": "false",
+            "variant": "Short-DINO-Intent video_prefix, history offsets [-8,-4,0], K=8; local 10ep run",
+        },
+    ),
+    (
+        "aihub_5b_dino_s_nointent_30trials_step_",
+        {
+            "valid": True,
+            "resume_type": "fresh AIHub/AMD 5B DINO-S no-intent train",
+            "learning_rate": "1e-4 cosine",
+            "global_batch": 128,
+            "pooling": "none [1,1]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S 5B video expert + 1B action expert",
+            "wan_init": "native Wan2.2 5B video init",
+            "variant": "AIHub/AMD 5B DINO-S no-intent, latent_spatial_pool=[1,1]; step010860 is the 20ep endpoint",
+            "manual_endpoint_step": 10860,
+            "manual_endpoint_epoch": 20.0,
+        },
+    ),
+    (
+        "aihub_5b_dino_s_nointent_30trials_step_010860",
+        {
+            "manual_epoch": 20.0,
+            "variant": "AIHub/AMD 5B DINO-S no-intent, 20ep endpoint, latent_spatial_pool=[1,1]",
+        },
+    ),
+    (
+        "aihub_5b_dino_s_context_intent_30trials_step_",
+        {
+            "valid": True,
+            "resume_type": "fresh AIHub/AMD 5B Short-DINO-Intent context-after-proprio train",
+            "learning_rate": "1e-4 cosine",
+            "global_batch": 128,
+            "pooling": "none [1,1]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": "DINO-S 5B video expert + 1B action expert + Short-DINO-Intent",
+            "wan_init": "native Wan2.2 5B video init",
+            "variant": "AIHub/AMD 5B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is the 20ep endpoint",
+            "manual_endpoint_step": 10860,
+            "manual_endpoint_epoch": 20.0,
+        },
+    ),
+    (
+        "aihub_5b_dino_s_context_intent_30trials_step_010860",
+        {
+            "manual_epoch": 20.0,
+            "variant": "AIHub/AMD 5B Short-DINO-Intent context-after-proprio, 20ep endpoint, history offsets [-8,-4,0], K=8",
+        },
+    ),
+    (
+        "aihub_5b_dino_s_context_intent_30trials_step_010000",
+        {
+            "valid": False,
+            "warning": "invalid/partial eval: libero_object task0 was interrupted, summary uses 39/40 tasks",
+            "variant": "AIHub/AMD 5B Short-DINO-Intent context-after-proprio, partial 39/40-task eval at step010000",
+        },
+    ),
+    (
         "short_dino_intent_30trials_step_",
         {
             "valid": True,
@@ -717,6 +812,24 @@ def load_eval(summary_path: Path) -> dict[str, Any] | None:
     if not cfg and isinstance(summary.get("config"), dict):
         cfg = summary["config"]
     epoch_info = estimate_epoch(step, meta, cfg)
+    manual_endpoint_step = meta.get("manual_endpoint_step")
+    manual_endpoint_epoch = meta.get("manual_endpoint_epoch")
+    if step is not None and manual_endpoint_step is not None and manual_endpoint_epoch is not None:
+        try:
+            endpoint_step = float(manual_endpoint_step)
+            if endpoint_step > 0:
+                epoch = float(step) / endpoint_step * float(manual_endpoint_epoch)
+                epoch_info["epoch"] = round(epoch, 2)
+                epoch_info["run_epoch"] = round(epoch, 2)
+        except (TypeError, ValueError):
+            pass
+    manual_epoch = meta.get("manual_epoch")
+    if manual_epoch is not None:
+        try:
+            epoch_info["epoch"] = round(float(manual_epoch), 2)
+            epoch_info["run_epoch"] = round(float(manual_epoch), 2)
+        except (TypeError, ValueError):
+            pass
     suites: dict[str, dict[str, Any]] = {}
     for suite in SUITES:
         stats = (summary.get("suite_stats") or {}).get(suite) or {}
