@@ -566,6 +566,149 @@ MANUAL_NOTES: list[tuple[str, dict[str, Any]]] = [
     ),
 ]
 
+MANUAL_EVALS: list[dict[str, Any]] = [
+    {
+        "id": "amd_manual_1b_context_intent_step_005000",
+        "step": 5000,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 96,
+        "model": "DINO-S small-video + Short-DINO-Intent",
+        "variant": "AMD manual 1B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 95.0, "libero_object": 99.3, "libero_goal": 87.3, "libero_10": 63.7, "overall": 86.3},
+    },
+    {
+        "id": "amd_manual_1b_context_intent_step_006000",
+        "step": 6000,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 96,
+        "model": "DINO-S small-video + Short-DINO-Intent",
+        "variant": "AMD manual 1B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 88.0, "libero_object": 99.3, "libero_goal": 86.7, "libero_10": 78.0, "overall": 88.0},
+    },
+    {
+        "id": "amd_manual_1b_context_intent_step_008000",
+        "step": 8000,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 96,
+        "model": "DINO-S small-video + Short-DINO-Intent",
+        "variant": "AMD manual 1B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 95.3, "libero_object": 100.0, "libero_goal": 91.0, "libero_10": 79.3, "overall": 91.4},
+    },
+    {
+        "id": "amd_manual_1b_context_intent_step_009000",
+        "step": 9000,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 96,
+        "model": "DINO-S small-video + Short-DINO-Intent",
+        "variant": "AMD manual 1B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 97.3, "libero_object": 98.3, "libero_goal": 94.3, "libero_10": 89.0, "overall": 94.8},
+    },
+    {
+        "id": "amd_manual_1b_context_intent_step_010000",
+        "step": 10000,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 96,
+        "model": "DINO-S small-video + Short-DINO-Intent",
+        "variant": "AMD manual 1B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 96.3, "libero_object": 99.7, "libero_goal": 94.3, "libero_10": 85.3, "overall": 93.9},
+    },
+    {
+        "id": "amd_manual_1b_context_intent_step_010860",
+        "step": 10860,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 96,
+        "model": "DINO-S small-video + Short-DINO-Intent",
+        "variant": "AMD manual 1B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 97.3, "libero_object": 99.7, "libero_goal": 96.3, "libero_10": 86.3, "overall": 94.9},
+    },
+    {
+        "id": "amd_manual_5b_nointent_step_005000",
+        "step": 5000,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 128,
+        "model": "DINO-S 5B video expert + 1B action expert",
+        "variant": "AMD manual 5B DINO-S no-intent, latent_spatial_pool=[1,1]; step010860 is 20ep",
+        "scores": {"libero_spatial": 91.7, "libero_object": 98.3, "libero_goal": 76.3, "libero_10": 50.7, "overall": 79.2},
+    },
+    {
+        "id": "amd_manual_5b_nointent_step_010860",
+        "step": 10860,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 128,
+        "model": "DINO-S 5B video expert + 1B action expert",
+        "variant": "AMD manual 5B DINO-S no-intent, latent_spatial_pool=[1,1]; step010860 is 20ep",
+        "scores": {"libero_spatial": 95.0, "libero_object": 99.3, "libero_goal": 97.7, "libero_10": 84.7, "overall": 94.2},
+    },
+    {
+        "id": "amd_manual_5b_context_intent_step_005000",
+        "step": 5000,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 128,
+        "model": "DINO-S 5B video expert + 1B action expert + Short-DINO-Intent",
+        "variant": "AMD manual 5B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 74.3, "libero_object": 95.0, "libero_goal": 81.0, "libero_10": 66.0, "overall": 79.1},
+    },
+    {
+        "id": "amd_manual_5b_context_intent_step_006000",
+        "step": 6000,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 128,
+        "model": "DINO-S 5B video expert + 1B action expert + Short-DINO-Intent",
+        "variant": "AMD manual 5B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 94.7, "libero_object": 98.7, "libero_goal": 88.7, "libero_10": 75.7, "overall": 89.4},
+    },
+    {
+        "id": "amd_manual_5b_context_intent_step_009000",
+        "step": 9000,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 128,
+        "model": "DINO-S 5B video expert + 1B action expert + Short-DINO-Intent",
+        "variant": "AMD manual 5B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 96.3, "libero_object": 100.0, "libero_goal": 91.3, "libero_10": 80.7, "overall": 92.1},
+    },
+    {
+        "id": "amd_manual_5b_context_intent_step_010000",
+        "step": 10000,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 128,
+        "model": "DINO-S 5B video expert + 1B action expert + Short-DINO-Intent",
+        "variant": "AMD manual 5B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 90.7, "libero_object": 100.0, "libero_goal": 95.3, "libero_10": 88.7, "overall": 93.7},
+    },
+    {
+        "id": "amd_manual_5b_context_intent_step_010500",
+        "step": 10500,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 128,
+        "model": "DINO-S 5B video expert + 1B action expert + Short-DINO-Intent",
+        "variant": "AMD manual 5B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 94.0, "libero_object": 99.7, "libero_goal": 92.3, "libero_10": 82.7, "overall": 92.2},
+    },
+    {
+        "id": "amd_manual_5b_context_intent_step_010860",
+        "step": 10860,
+        "endpoint_step": 10860,
+        "endpoint_epoch": 20.0,
+        "global_batch": 128,
+        "model": "DINO-S 5B video expert + 1B action expert + Short-DINO-Intent",
+        "variant": "AMD manual 5B Short-DINO-Intent context-after-proprio, history offsets [-8,-4,0], K=8; step010860 is 20ep",
+        "scores": {"libero_spatial": 93.0, "libero_object": 100.0, "libero_goal": 95.7, "libero_10": 82.0, "overall": 92.7},
+    },
+]
+
 
 def rel(path: Path) -> str:
     return path.resolve().relative_to(ROOT).as_posix()
@@ -895,6 +1038,66 @@ def load_eval(summary_path: Path) -> dict[str, Any] | None:
     }
 
 
+def load_manual_eval(record: dict[str, Any], index: int) -> dict[str, Any]:
+    scores = record["scores"]
+    step = int(record["step"])
+    endpoint_step = float(record.get("endpoint_step") or step)
+    endpoint_epoch = float(record.get("endpoint_epoch") or 20.0)
+    epoch = round(float(step) / endpoint_step * endpoint_epoch, 2) if endpoint_step > 0 else None
+    source_note = "AMD machine eval from user-provided screenshot; suite-level only, no local summary.json/task videos."
+    suites = {}
+    for suite in SUITES:
+        score = float(scores[suite])
+        suites[suite] = {
+            "score": score,
+            "trials": 300,
+            "successes": int(round(score * 3.0)),
+            "time_s": None,
+            "max_time_s": None,
+        }
+
+    mtime = datetime(2026, 6, 19, 0, 0, tzinfo=timezone.utc).timestamp() + index
+    return {
+        "id": record["id"],
+        "eval_dir": "manual/amd_user_provided_screenshot",
+        "summary_path": None,
+        "ckpt": None,
+        "step": step,
+        "epoch": epoch,
+        "run_epoch": epoch,
+        "resume_base_epoch": None,
+        "steps_per_epoch": round(endpoint_step / endpoint_epoch) if endpoint_epoch > 0 else None,
+        "resume_base_steps_per_epoch": None,
+        "train_sample_count": DEFAULT_TRAIN_SAMPLE_COUNT,
+        "mtime": mtime,
+        "mtime_text": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"),
+        "eval_date": "06-19 AMD",
+        "overall": float(scores["overall"]),
+        "average_task_time_s": None,
+        "suites": suites,
+        "tasks": [],
+        "bad_tasks": [],
+        "meta": {
+            "valid": True,
+            "warning": source_note,
+            "resume_type": "AMD manual eval screenshot / user-provided table",
+            "learning_rate": "1e-4 cosine",
+            "global_batch": record["global_batch"],
+            "pooling": "none [1,1]",
+            "lambda_video": 0.05,
+            "lambda_action": 5.0,
+            "model": record["model"],
+            "wan_init": record.get("wan_init", "see variant"),
+            "variant": record["variant"],
+            "manual_endpoint_step": int(endpoint_step),
+            "manual_endpoint_epoch": endpoint_epoch,
+            "manual_epoch": 20.0 if step == int(endpoint_step) else None,
+            "eval_platform": "AMD",
+            "source": "user-provided screenshot on 2026-06-19",
+        },
+    }
+
+
 def chronological_order(item: dict[str, Any]) -> tuple[float, str]:
     """Sort oldest to newest so the latest evaluation appears at the bottom."""
     return (float(item.get("mtime") or 0.0), item["id"])
@@ -935,6 +1138,8 @@ def build() -> dict[str, Any]:
         item = load_eval(summary_path)
         if item:
             evals.append(item)
+    for index, record in enumerate(MANUAL_EVALS):
+        evals.append(load_manual_eval(record, index))
     evals.sort(key=chronological_order)
 
     valid = [e for e in evals if e["meta"].get("valid", True)]
