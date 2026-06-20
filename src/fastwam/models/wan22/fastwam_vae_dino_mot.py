@@ -385,15 +385,30 @@ class FastWAMVAEDinoMoT(nn.Module):
         action_is_pad = sample.get("action_is_pad", None)
         image_is_pad = sample.get("image_is_pad", None)
 
+        if sample.get("history_dino_latents", None) is not None or sample.get("history_video", None) is not None:
+            raise ValueError(
+                "FastWAMVAEDinoMoT does not consume short-intent history tokens. "
+                "Disable `data.train.load_history_dino_latents` for this three-branch MoT variant."
+            )
+
         if video.ndim != 5 or video.shape[1] != 3:
             raise ValueError(f"`video` must be 5D [B,3,T,H,W], got shape {tuple(video.shape)}")
         if action.ndim != 3:
             raise ValueError(f"`action` must be 3D [B,T,A], got shape {tuple(action.shape)}")
         batch_size = video.shape[0]
+        temporal_factor = int(self.vae.temporal_downsample_factor)
+        if temporal_factor <= 0:
+            raise ValueError(f"`vae.temporal_downsample_factor` must be positive, got {temporal_factor}.")
         if action.shape[0] != batch_size:
             raise ValueError(f"Batch mismatch between video and action: {batch_size} vs {action.shape[0]}")
         if video.shape[2] <= 1:
             raise ValueError(f"`video` must include f0 plus future frames, got T={video.shape[2]}")
+        if (video.shape[2] - 1) % temporal_factor != 0:
+            raise ValueError(
+                "RGB video temporal length is incompatible with Wan VAE latent downsampling: "
+                f"T={video.shape[2]}, temporal_downsample_factor={temporal_factor}. "
+                "Expected (T - 1) % temporal_downsample_factor == 0."
+            )
         if action.shape[1] % (video.shape[2] - 1) != 0:
             raise ValueError(
                 "`action` temporal dimension must be divisible by video transitions: "

@@ -2,10 +2,10 @@
 
 defaults:
   - override /data: libero_2cam
-  - override /model: fastwam_vae_dino_mot_s_smallvideo
+  - override /model: fastwam_wan5b_dino_s_aux_mot
   - _self_
 
-# VAE+DINO three-branch MoT is heavier than the pure 1B DINO/VAE runs.
+# Wan5B VAE/RGB + 1B DINO-S auxiliary three-branch MoT is heavier than the pure 1B DINO/VAE runs.
 # Keep per-GPU batch conservative by default; override on H200/AMD if memory allows.
 batch_size: 2
 num_workers: 8

@@ -7,21 +7,24 @@ proprio_dim: ${data.train.processor.proprio_output_dim}
 redirect_common_files: true
 mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
-vae_video_dit_pretrained_path: checkpoints/WanVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt
+# Keep the VAE/RGB latent branch as the native Wan2.2-5B FastWAM world model.
+# Leave this null so `load_wan22_ti2v_5b_components()` loads the original Wan
+# video DiT instead of the 1B smallvideo-interpolated checkpoint.
+vae_video_dit_pretrained_path: null
 dino_video_dit_pretrained_path: checkpoints/DinoVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
 
 # Three-branch MoT ablation:
-# - VAE/Wan latent branch remains the primary FastWAM world-model target.
-# - DINO branch is an auxiliary future-token prediction target.
+# - Native Wan2.2-5B VAE/RGB latent branch remains the primary FastWAM world-model target.
+# - 1B DINO-S small-video branch is an auxiliary future-token prediction target.
 # - Action branch keeps FastWAM visibility: action reads f0/current VAE+DINO and action,
 #   but never noisy future VAE/DINO tokens.
 vae_video_dit_config:
   has_image_input: false
   patch_size: [1, 2, 2]
   in_dim: 48
-  hidden_dim: 1024
-  ffn_dim: 4096
+  hidden_dim: 3072
+  ffn_dim: 14336
   freq_dim: 256
   text_dim: 4096
   out_dim: 48
