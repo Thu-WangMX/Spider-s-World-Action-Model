@@ -715,3 +715,112 @@ Short-DINO-Intent video_prefix, lr5e-5 cosine, full resume from step_006000, run
 ```
 
 如果未来要做真正 fresh `1e-4` video_prefix 对照，需要新建不同 `RUN_ID`，且确保 `resume=null`，不要复用这个 run 目录。
+
+## 13. 2026-06-21 handoff：LIBERO-Plus 后的新主线
+
+本节记录 6/19-6/21 期间的新结论，方便新对话继续。
+
+### 13.1 当前已经完成的关键评测
+
+LIBERO-Plus 4 个主要 checkpoint 已经全量跑完，每个都是 `10030` 个 perturbation tasks、每个 task `1 trial`：
+
+| 变体 | checkpoint | Original / LIBERO | Camera | Robot | Lang. | Light | BG | Noise | Layout | Plus Total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1B no-intent DINO no-pool，本机 | `step_028930` | 96.25 | 28.46 | 21.94 | 50.03 | 74.69 | 40.99 | 25.80 | 46.69 | 39.71 |
+| 1B context-intent DINO，AMD 20ep | `step_010860` | 94.90 | 30.96 | 19.42 | 53.42 | 73.99 | 40.15 | 26.42 | 53.25 | 41.17 |
+| 5B no-intent DINO，AMD 20ep | `step_010860` | 94.20 | 27.33 | 16.39 | 54.59 | 72.42 | 50.28 | 17.80 | 49.31 | 39.23 |
+| 5B context-intent DINO，AMD 20ep | `step_010860` | 92.70 | 33.77 | 15.23 | 52.31 | 81.17 | 54.65 | 30.61 | 51.87 | 43.63 |
+
+对应结果目录：
+
+```text
+evaluate_results/libero_plus/libero_plus_1b_nopool_nointent_20ep_step028930_10030tasks_1trial_8gpu_wpg4_20260618_084620
+evaluate_results/libero_plus/libero_plus_amd_1b_context_intent_20ep_step010860_10030tasks_1trial_6gpu_wpg4_20260619_093915
+evaluate_results/libero_plus/libero_plus_amd_5b_nointent_20ep_step010860_10030tasks_1trial_6gpu_wpg3_20260619_093915
+evaluate_results/libero_plus/libero_plus_amd_5b_context_intent_step010860_10030tasks_1trial_6gpu_wpg3_20260619_093915
+```
+
+和论文表里的 Fast-WAM 对比：
+
+| Model | Original | Camera | Robot | Lang. | Light | BG | Noise | Layout | Total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Fast-WAM | 97.60 | 16.40 | 44.50 | 68.90 | 78.20 | 53.70 | 37.70 | 60.70 | 51.50 |
+| Our best DINO-only per column | 96.25 | 33.77 | 21.94 | 54.59 | 81.17 | 54.65 | 30.61 | 53.25 | 43.63 |
+
+核心判断：
+
+- DINO-only 没有证明可以全面替代 Wan/VAE world model；Plus Total 仍低于 Fast-WAM。
+- DINO-only 在 Camera、Light、BG 上有信号，符合 DINO 预训练对视角/光照/外观变化更稳定的直觉。
+- Robot、Language、Noise、Layout 明显弱，说明纯 DINO dynamics 可能丢失了控制所需的精细几何、语言适配和像素扰动鲁棒性。
+- Intent 在 Plus 上有正向作用：1B context-intent 比 1B no-intent `+1.46 Total`，5B context-intent 比 5B no-intent `+4.40 Total`。这比原始 LIBERO 上更明显，说明历史信息在 OOD perturbation 下可能更有价值。
+
+### 13.2 LIBERO-Plus 子集含义
+
+LIBERO-Plus 论文把 perturbation 分成 7 类：
+
+- Camera Viewpoints：相机视角变化。
+- Robot Initial States：机器人初始状态/姿态变化。
+- Language Instructions：语言指令改写或扰动。
+- Light Conditions：光照变化。
+- Background Textures：背景/纹理变化。
+- Sensor Noise：视觉传感器噪声或图像扰动。
+- Objects Layout：物体布局、干扰物、目标位置等变化。
+
+本地 `10030` 个任务的大致计数：
+
+| subset | count |
+|---|---:|
+| Sensor Noise | 1601 |
+| Camera Viewpoints | 1599 |
+| Robot Initial States | 1550 |
+| Language Instructions | 1537 |
+| Objects Layout | 1525 |
+| Light Conditions | 1142 |
+| Background Textures | 1076 |
+
+### 13.3 当前正在跑的训练
+
+截至 2026-06-21，用户反馈有两条训练正在跑，预计约 58 小时后、周三上午出结果：
+
+1. 本机 8 卡：`1B-DINO video_prefix Short-DINO-Intent` 继续训练。
+   - 动机：`video_prefix` 10ep 的 best (`step_026000`, Overall 94.00) 已经超过 no-intent 10ep fresh (`93.58`)，但还没到 no-intent 20ep (`96.25`)。
+   - 继续时应优先从 `step_026000` 这种 best checkpoint 小学习率 weight-only resume，而不是从 final `step_028930` 继续。
+   - 参考 no-pool 从 10ep 到 20ep 的成功 recipe：weight-only、`lr=1e-5`、继续 10ep 左右。
+
+2. 另一台 8 卡 H200：`3-branch MoT no-intent`。
+   - 新配置：
+     - `configs/model/fastwam_wan5b_dino_s_aux_mot.yaml`
+     - `configs/task/libero_wan5b_dino_s_aux_mot_2cam_224_1e-4.yaml`
+   - 结构：Wan/VAE video branch + DINO auxiliary branch + action branch。
+   - VAE branch 使用原生 Wan 5B hidden/ffn，不使用插值出来的 1B smallvideo checkpoint。
+   - DINO branch 仍使用当前 1B DINO route 的 token/loss 设计。
+   - 默认 loss：`lambda_video=1.0, lambda_action=1.0, lambda_dino=0.02`。
+   - 当前 no-intent 版本先验证“DINO 作为辅助监督是否能和 Wan/VAE 主干共存”。
+
+### 13.4 3-branch MoT 设计判断
+
+目前更合理的叙事已经从“DINO 替代 VAE”转为“DINO 辅助 Wan/VAE”：
+
+- 纯 DINO 1B 在原始 LIBERO 上能接近 Fast-WAM，说明 DINO token dynamics 有可取之处。
+- 但 Plus 上纯 DINO 的总鲁棒性不如 Fast-WAM，说明完全丢掉 VAE/Wan latent 不是最稳路线。
+- 3-branch MoT 的目标是保留 Wan/VAE 的语言/生成式世界建模能力，同时用 DINO auxiliary loss 引入 Camera/Light/BG 这类 OOD 更稳定的语义特征。
+
+如果周三 `3-branch MoT no-intent` 有提升：
+
+1. 优先继续做 `3-branch MoT + Short-DINO-Intent`。
+2. Intent 更建议先用已有更稳的 history encoder；注入方式可先从当前表现更好的 `video_prefix` 思路出发，但必须重新检查三分支 mask。
+3. 评测顺序应同时看原始 LIBERO 和 LIBERO-Plus，不能只看原榜。
+
+如果周三 `3-branch MoT no-intent` 没有提升：
+
+1. 先排查 loss 权重和 branch interaction，不要直接否定 DINO auxiliary。
+2. 可尝试更低 `lambda_dino` (`0.01`) 或 warmup 后再开 DINO loss。
+3. 若 LIBERO 原榜掉分明显，说明辅助分支干扰了主 VAE/action dynamics，需要更弱耦合或 delayed auxiliary。
+
+### 13.5 新对话优先接续项
+
+1. 等周三两条训练结果：`video_prefix resume` 和 `3-branch MoT no-intent`。
+2. 对新 checkpoint 先跑原始 LIBERO 30-trial，再挑 best 跑 LIBERO-Plus。
+3. 若 3-branch MoT 有提升，立刻排 `3-branch MoT + intent`。
+4. 若 `video_prefix` 继续提分，保留它作为 Short-DINO-Intent 主路线；如果只在 10ep 附近小幅超过 no-intent fresh，但追不上 no-intent 20ep，则不再单独投入太多 GPU。
+5. Robotwin 是否要跑：可以作为下一阶段泛化验证，但先让 LIBERO-Plus 和 3-branch 结论稳定下来。
