@@ -112,7 +112,8 @@ run_verify() {
   log "Stage=verify mmap cache=${MMAP_CACHE_DIR}"
   require_file "${MMAP_CACHE_DIR}/metadata.json" "Robotwin mmap cache metadata"
 
-  "${PYTHON}" - <<'PY' 2>&1 | tee -a "${LOG_FILE}"
+  MMAP_CACHE_DIR="${MMAP_CACHE_DIR}" "${PYTHON}" - <<'PY' 2>&1 | tee -a "${LOG_FILE}"
+import os
 from pathlib import Path
 
 from hydra import compose, initialize_config_dir
@@ -122,11 +123,13 @@ from omegaconf import OmegaConf
 root = Path.cwd()
 config_dir = str(root / "configs")
 task = "robotwin_wan5b_dino_s_aux_mot_short_intent_3cam_384x320_1e-4"
+mmap_cache_dir = os.environ["MMAP_CACHE_DIR"]
 with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
     cfg = compose(
         config_name="train",
         overrides=[
             f"task={task}",
+            f"data.train.dino_latent_cache_dir={mmap_cache_dir}",
             "data.train.load_text_context=false",
             "data.train.val_set_proportion=0.0",
             "data.val=null",
