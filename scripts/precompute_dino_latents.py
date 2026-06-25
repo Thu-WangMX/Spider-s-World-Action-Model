@@ -174,6 +174,34 @@ class _FrameVideoDataset(Dataset):
 
         if len(camera_frames) == 1:
             image = camera_frames[0]
+        elif self.robot_dataset.concat_multi_camera == "robotwin":
+            if len(camera_frames) != 3:
+                raise ValueError(
+                    f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {len(camera_frames)}."
+                )
+            cam_top = torch.nn.functional.interpolate(
+                camera_frames[0].unsqueeze(0),
+                size=(256, 320),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )[0]
+            cam_left = torch.nn.functional.interpolate(
+                camera_frames[1].unsqueeze(0),
+                size=(128, 160),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )[0]
+            cam_right = torch.nn.functional.interpolate(
+                camera_frames[2].unsqueeze(0),
+                size=(128, 160),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )[0]
+            bottom = torch.cat([cam_left, cam_right], dim=-1)
+            image = torch.cat([cam_top, bottom], dim=-2)
         elif self.robot_dataset.concat_multi_camera == "horizontal":
             image = torch.cat(camera_frames, dim=-1)
         elif self.robot_dataset.concat_multi_camera == "vertical":
@@ -181,7 +209,7 @@ class _FrameVideoDataset(Dataset):
         else:
             raise ValueError(
                 "Frame-level DINO precompute currently supports concat_multi_camera "
-                f"horizontal/vertical for LIBERO, got {self.robot_dataset.concat_multi_camera}."
+                f"horizontal/vertical/robotwin, got {self.robot_dataset.concat_multi_camera}."
             )
 
         image = self.robot_dataset.resize_transform(image)

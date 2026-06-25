@@ -562,6 +562,12 @@ class FastWAMVAEDinoMoT(nn.Module):
                 non_blocking=True,
             )
         else:
+            if not bool(getattr(self.dino_encoder, "_loaded", False)):
+                raise ValueError(
+                    "Missing `dino_latents` while DINO backbone loading is disabled. "
+                    "Set `data.train.dino_latent_cache_dir`/`data.val.dino_latent_cache_dir` "
+                    "to a valid frame or frame_mmap cache, or set `model.dino_config.load_backbone=true`."
+                )
             input_dino_latents = self._encode_video_dino(input_video)
             self._validate_dino_latent_shape(input_dino_latents)
 

@@ -158,6 +158,8 @@ class WorldActionRobotWinPolicy:
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
+        if model_cfg_copy.get("dino_config") is not None:
+            model_cfg_copy.dino_config.load_backbone = True
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
@@ -180,6 +182,18 @@ class WorldActionRobotWinPolicy:
         self._num_video_frames = int(num_video_frames)
 
         self.pending_actions: deque[np.ndarray] = deque()
+        intent_cfg = getattr(self.model, "intent_config", {}) or {}
+        self._uses_intent_history = bool(getattr(self.model, "intent_encoder", None) is not None)
+        self._history_offsets = [
+            int(offset)
+            for offset in intent_cfg.get(
+                "history_offsets",
+                intent_cfg.get("history_dino_frame_offsets", [-8, -4, 0]),
+            )
+        ]
+        self._history_images: deque[torch.Tensor] = deque(
+            maxlen=max([1, *[-offset + 1 for offset in self._history_offsets]])
+        )
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
@@ -233,8 +247,31 @@ class WorldActionRobotWinPolicy:
         image_tensor = image_tensor * (2.0 / 255.0) - 1.0
         return image_tensor
 
-    def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
-        image_tensor = self._build_robotwin_image_tensor(observation)
+    def _append_history_image(self, image_tensor: torch.Tensor) -> None:
+        if self._uses_intent_history:
+            self._history_images.append(image_tensor.detach())
+
+    def _build_history_video_tensor(self) -> Optional[torch.Tensor]:
+        if not self._uses_intent_history or not self._history_images:
+            return None
+
+        frames = list(self._history_images)
+        last_idx = len(frames) - 1
+        selected = []
+        for offset in self._history_offsets:
+            selected_idx = min(max(last_idx + int(offset), 0), last_idx)
+            selected.append(frames[selected_idx])
+        return torch.stack(selected, dim=2).contiguous()  # [1, 3, T, H, W]
+
+    def _infer_action_chunk(
+        self,
+        observation: Dict[str, Any],
+        instruction: str,
+        image_tensor: Optional[torch.Tensor] = None,
+    ) -> np.ndarray:
+        if image_tensor is None:
+            image_tensor = self._build_robotwin_image_tensor(observation)
+            self._append_history_image(image_tensor)
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
         proprio = self._normalize_state(state_vector)
 
@@ -254,6 +291,9 @@ class WorldActionRobotWinPolicy:
         }
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
+        history_video = self._build_history_video_tensor()
+        if history_video is not None and "history_video" in inspect.signature(self.model.infer_action).parameters:
+            infer_kwargs["history_video"] = history_video
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
@@ -264,16 +304,32 @@ class WorldActionRobotWinPolicy:
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
         return action_chunk
 
-    def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
-        action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
+    def _fill_action_queue(
+        self,
+        observation: Dict[str, Any],
+        instruction: str,
+        image_tensor: Optional[torch.Tensor] = None,
+    ) -> None:
+        action_chunk = self._infer_action_chunk(
+            observation=observation,
+            instruction=instruction,
+            image_tensor=image_tensor,
+        )
         n_exec = min(self.replan_steps, action_chunk.shape[0])
         for i in range(n_exec):
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
 
     def should_request_observation(self) -> bool:
+        if self._uses_intent_history:
+            return True
         return not self.pending_actions
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
+        image_tensor = None
+        if observation is not None:
+            image_tensor = self._build_robotwin_image_tensor(observation)
+            self._append_history_image(image_tensor)
+
         if not self.pending_actions:
             if observation is None:
                 raise ValueError(
@@ -281,7 +337,11 @@ class WorldActionRobotWinPolicy:
                     "(replan step for fastwam)."
                 )
             instruction = task_env.get_instruction()
-            self._fill_action_queue(observation=observation, instruction=instruction)
+            self._fill_action_queue(
+                observation=observation,
+                instruction=instruction,
+                image_tensor=image_tensor,
+            )
 
         if not self.pending_actions:
             logger.warning("No action generated; skip current eval step.")
@@ -306,6 +366,7 @@ class WorldActionRobotWinPolicy:
 
     def reset(self) -> None:
         self.pending_actions.clear()
+        self._history_images.clear()
         self.episode_count += 1
         self.step_count = 0
         self.reset_timing_rollout()
