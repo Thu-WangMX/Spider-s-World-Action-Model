@@ -11,7 +11,11 @@ MMAP_CACHE_DIR="${MMAP_CACHE_DIR:-./data/dino_latents_cache/robotwin_dino_s_3cam
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 DINO_PRECOMPUTE_BATCH_SIZE="${DINO_PRECOMPUTE_BATCH_SIZE:-8}"
 DINO_PRECOMPUTE_NUM_WORKERS="${DINO_PRECOMPUTE_NUM_WORKERS:-4}"
+DINO_ENCODE_MICROBATCH_SIZE="${DINO_ENCODE_MICROBATCH_SIZE:-8}"
 DINO_LATENT_CACHE_DTYPE="${DINO_LATENT_CACHE_DTYPE:-bf16}"
+DINO_MMAP_READ_WORKERS="${DINO_MMAP_READ_WORKERS:-16}"
+DINO_MMAP_READ_BATCH_SIZE="${DINO_MMAP_READ_BATCH_SIZE:-512}"
+DINO_MMAP_FLUSH_EVERY="${DINO_MMAP_FLUSH_EVERY:-0}"
 STAGE="${STAGE:-all}"  # all, frames, mmap, verify
 OVERWRITE="${OVERWRITE:-false}"
 LOG_DIR="${LOG_DIR:-./logs/robotwin_dino_cache}"
@@ -68,7 +72,7 @@ run_frames() {
 
   log "Stage=frames task=${TASK}"
   log "Frame cache dir: ${FRAME_CACHE_DIR}"
-  log "nproc=${NPROC_PER_NODE}, batch=${DINO_PRECOMPUTE_BATCH_SIZE}, workers=${DINO_PRECOMPUTE_NUM_WORKERS}, dtype=${DINO_LATENT_CACHE_DTYPE}, overwrite=${overwrite_bool}"
+  log "nproc=${NPROC_PER_NODE}, batch=${DINO_PRECOMPUTE_BATCH_SIZE}, workers=${DINO_PRECOMPUTE_NUM_WORKERS}, encode_microbatch=${DINO_ENCODE_MICROBATCH_SIZE}, dtype=${DINO_LATENT_CACHE_DTYPE}, overwrite=${overwrite_bool}"
 
   "${PYTHON}" -m torch.distributed.run \
     --standalone \
@@ -82,6 +86,7 @@ run_frames() {
     dino_latent_cache_dtype="${DINO_LATENT_CACHE_DTYPE}" \
     overwrite="${overwrite_bool}" \
     model.dino_config.load_backbone=true \
+    model.dino_config.encode_microbatch_size="${DINO_ENCODE_MICROBATCH_SIZE}" \
     2>&1 | tee -a "${LOG_FILE}"
 }
 
@@ -92,6 +97,7 @@ run_mmap() {
   fi
 
   log "Stage=mmap src=${FRAME_CACHE_DIR} dst=${MMAP_CACHE_DIR}"
+  log "mmap read_workers=${DINO_MMAP_READ_WORKERS}, read_batch_size=${DINO_MMAP_READ_BATCH_SIZE}, flush_every=${DINO_MMAP_FLUSH_EVERY}"
   require_dir "${FRAME_CACHE_DIR}/frames" "Robotwin frame cache directory"
 
   if [[ "$(bool_arg "${OVERWRITE}")" == "false" && -s "${MMAP_CACHE_DIR}/metadata.json" ]]; then
@@ -104,6 +110,9 @@ run_mmap() {
   "${PYTHON}" scripts/convert_dino_frame_cache_to_mmap.py \
     --src "${FRAME_CACHE_DIR}" \
     --dst "${MMAP_CACHE_DIR}" \
+    --read-workers "${DINO_MMAP_READ_WORKERS}" \
+    --read-batch-size "${DINO_MMAP_READ_BATCH_SIZE}" \
+    --flush-every "${DINO_MMAP_FLUSH_EVERY}" \
     "${overwrite_flag[@]}" \
     2>&1 | tee -a "${LOG_FILE}"
 }

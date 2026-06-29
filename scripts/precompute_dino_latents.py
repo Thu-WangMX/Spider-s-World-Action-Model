@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +39,16 @@ def _init_distributed():
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
 
+    timeout_seconds = int(os.environ.get("DINO_DIST_TIMEOUT_SECONDS", "86400"))
+    if timeout_seconds <= 0:
+        raise ValueError(f"DINO_DIST_TIMEOUT_SECONDS must be positive, got {timeout_seconds}")
+
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend, init_method="env://")
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=timedelta(seconds=timeout_seconds),
+        )
 
     return True, dist.get_rank(), dist.get_world_size(), local_rank
 

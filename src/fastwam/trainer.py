@@ -81,6 +81,7 @@ class Wan22Trainer:
         self._assert_dataset_length_consistent(self.train_dataset, "train_dataset")
         if self.val_dataset is not None:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
+        self._assert_history_intent_offsets_consistent()
 
         self._weight_checkpoint_loaded_pre_prepare = False
         self._load_weight_checkpoint_before_prepare()
@@ -215,6 +216,60 @@ class Wan22Trainer:
         raise RuntimeError(
             f"{dataset_name} length mismatch across ranks: {gathered_lengths.cpu().tolist()}"
         )
+
+    def _assert_history_intent_offsets_consistent(self):
+        intent_encoder = getattr(self.model, "intent_encoder", None)
+        if intent_encoder is None:
+            return
+
+        intent_config = getattr(self.model, "intent_config", None) or {}
+        model_offsets = intent_config.get(
+            "history_offsets",
+            intent_config.get("history_dino_frame_offsets", None),
+        )
+        if model_offsets is None:
+            raise ValueError(
+                "`model.intent_config.history_offsets` must be set when "
+                "`model.intent_config.enabled=true`."
+            )
+        model_offsets = [int(offset) for offset in model_offsets]
+        max_history_frames = int(intent_config.get("max_history_frames", len(model_offsets)))
+        if max_history_frames < len(model_offsets):
+            raise ValueError(
+                "`model.intent_config.max_history_frames` must be >= len(history_offsets), "
+                f"got {max_history_frames} and {len(model_offsets)}."
+            )
+
+        datasets = [("train_dataset", self.train_dataset)]
+        if self.val_dataset is not None:
+            datasets.append(("val_dataset", self.val_dataset))
+        for dataset_name, dataset in datasets:
+            load_history = bool(getattr(dataset, "load_history_dino_latents", False))
+            if not load_history:
+                raise ValueError(
+                    f"{dataset_name} must set `load_history_dino_latents=true` when "
+                    "`model.intent_config.enabled=true`."
+                )
+            dataset_offsets = getattr(dataset, "history_dino_frame_offsets", None)
+            if dataset_offsets is None:
+                raise ValueError(
+                    f"{dataset_name} has no `history_dino_frame_offsets`; cannot verify "
+                    "Short-DINO-Intent train/infer consistency."
+                )
+            dataset_offsets = [int(offset) for offset in dataset_offsets]
+            if dataset_offsets != model_offsets:
+                raise ValueError(
+                    "Short-DINO-Intent history offset mismatch between model and dataset: "
+                    f"model.intent_config.history_offsets={model_offsets}, "
+                    f"{dataset_name}.history_dino_frame_offsets={dataset_offsets}."
+                )
+
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Short-DINO-Intent history offsets verified: offsets=%s max_history_frames=%d",
+                model_offsets,
+                max_history_frames,
+            )
 
     def _estimate_total_train_steps(self) -> int:
         if self.max_steps is not None:
