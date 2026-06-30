@@ -389,38 +389,48 @@ class Wan22Trainer:
 
     @staticmethod
     def _to_batched_eval_sample(sample):
-        video = sample["video"]
-        prompt = sample["prompt"]
+        video = sample.get("video", None)
+        prompt = sample.get("prompt", None)
         action = sample.get("action", None)
         proprio = sample.get("proprio", None)
         context = sample.get("context", None)
         context_mask = sample.get("context_mask", None)
+        vae_latents = sample.get("vae_latents", None)
         dino_latents = sample.get("dino_latents", None)
         history_dino_latents = sample.get("history_dino_latents", None)
         action_is_pad = sample.get("action_is_pad", None)
         image_is_pad = sample.get("image_is_pad", None)
 
-        if not isinstance(video, torch.Tensor):
-            raise TypeError(
-                f"Expected tensor video for evaluation, got {type(video)}. "
-                "Evaluation now expects `video` with shape [3,T,H,W] or [B,3,T,H,W]."
-            )
-        if video.ndim == 4:
-            video = video.unsqueeze(0)
-        if video.ndim != 5:
-            raise ValueError(f"Expected video shape [3,T,H,W] or [B,3,T,H,W], got {tuple(video.shape)}")
-        num_video_frames = video.shape[2]
-        if num_video_frames <= 1:
-            raise ValueError(f"`sample['video']` must have at least 2 frames for action evaluation, got {num_video_frames}")
+        batch_size = None
+        num_video_frames = None
+        if video is not None:
+            if not isinstance(video, torch.Tensor):
+                raise TypeError(
+                    f"Expected tensor video for evaluation, got {type(video)}. "
+                    "Evaluation now expects `video` with shape [3,T,H,W] or [B,3,T,H,W]."
+                )
+            if video.ndim == 4:
+                video = video.unsqueeze(0)
+            if video.ndim != 5:
+                raise ValueError(f"Expected video shape [3,T,H,W] or [B,3,T,H,W], got {tuple(video.shape)}")
+            batch_size = int(video.shape[0])
+            num_video_frames = int(video.shape[2])
+            if num_video_frames <= 1:
+                raise ValueError(
+                    f"`sample['video']` must have at least 2 frames for action evaluation, got {num_video_frames}"
+                )
+        elif "video_frame_count" in sample:
+            num_video_frames = int(sample["video_frame_count"])
+            if num_video_frames <= 1:
+                raise ValueError(f"`video_frame_count` must be at least 2, got {num_video_frames}")
 
-        if isinstance(prompt, str):
-            prompt = [prompt]
-        elif isinstance(prompt, tuple):
-            prompt = list(prompt)
-        elif not isinstance(prompt, list):
-            raise TypeError(f"Expected prompt type str/list[str], got {type(prompt)}")
-        if len(prompt) != video.shape[0]:
-            raise ValueError(f"Prompt batch mismatch: len(prompt)={len(prompt)} vs video batch={video.shape[0]}")
+        if prompt is not None:
+            if isinstance(prompt, str):
+                prompt = [prompt]
+            elif isinstance(prompt, tuple):
+                prompt = list(prompt)
+            elif not isinstance(prompt, list):
+                raise TypeError(f"Expected prompt type str/list[str], got {type(prompt)}")
         
         action_horizon = None
         action = None
@@ -434,8 +444,10 @@ class Wan22Trainer:
                 action = action.unsqueeze(0)
             if action.ndim != 3:
                 raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
-            if action.shape[1] % (num_video_frames - 1) != 0:
-                raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
+            if batch_size is None:
+                batch_size = int(action.shape[0])
+            elif action.shape[0] != batch_size:
+                raise ValueError(f"Action batch mismatch: action={action.shape[0]} vs batch={batch_size}")
             action_horizon = int(action.shape[1])
 
         proprio = None
@@ -447,6 +459,10 @@ class Wan22Trainer:
                 proprio = proprio.unsqueeze(0)
             if proprio.ndim != 3:
                 raise ValueError(f"`sample['proprio']` must be 3D [B, T, d], got shape {tuple(proprio.shape)}")
+            if batch_size is None:
+                batch_size = int(proprio.shape[0])
+            elif proprio.shape[0] != batch_size:
+                raise ValueError(f"Proprio batch mismatch: proprio={proprio.shape[0]} vs batch={batch_size}")
 
         if context is not None or context_mask is not None:
             if context is None or context_mask is None:
@@ -459,6 +475,30 @@ class Wan22Trainer:
                 raise ValueError(
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
                 )
+            if batch_size is None:
+                batch_size = int(context.shape[0])
+            elif context.shape[0] != batch_size or context_mask.shape[0] != batch_size:
+                raise ValueError(
+                    "Context batch mismatch: "
+                    f"context={context.shape[0]} mask={context_mask.shape[0]} vs batch={batch_size}"
+                )
+
+        if vae_latents is not None:
+            if not isinstance(vae_latents, torch.Tensor):
+                raise TypeError(f"`sample['vae_latents']` must be a torch.Tensor, got {type(vae_latents)}")
+            if vae_latents.ndim == 4:
+                vae_latents = vae_latents.unsqueeze(0)
+            if vae_latents.ndim != 5:
+                raise ValueError(
+                    f"`sample['vae_latents']` must be [C,T,H,W] or [B,C,T,H,W], "
+                    f"got {tuple(vae_latents.shape)}"
+                )
+            if batch_size is None:
+                batch_size = int(vae_latents.shape[0])
+            elif vae_latents.shape[0] != batch_size:
+                raise ValueError(
+                    f"Eval VAE latent batch mismatch: vae={tuple(vae_latents.shape)} batch={batch_size}"
+                )
 
         if dino_latents is not None:
             if not isinstance(dino_latents, torch.Tensor):
@@ -470,11 +510,27 @@ class Wan22Trainer:
                     f"`sample['dino_latents']` must be [D,T,H,W] or [B,D,T,H,W], "
                     f"got {tuple(dino_latents.shape)}"
                 )
-            if dino_latents.shape[0] != video.shape[0] or dino_latents.shape[2] != video.shape[2]:
+            if batch_size is None:
+                batch_size = int(dino_latents.shape[0])
+            elif dino_latents.shape[0] != batch_size:
                 raise ValueError(
-                    "Eval DINO latent/video batch or temporal mismatch: "
-                    f"dino={tuple(dino_latents.shape)} video={tuple(video.shape)}"
+                    f"Eval DINO latent batch mismatch: dino={tuple(dino_latents.shape)} batch={batch_size}"
                 )
+            if num_video_frames is None:
+                num_video_frames = int(dino_latents.shape[2])
+            elif dino_latents.shape[2] != num_video_frames:
+                raise ValueError(
+                    "Eval DINO latent/video temporal mismatch: "
+                    f"dino={tuple(dino_latents.shape)} video_T={num_video_frames}"
+                )
+
+        if prompt is not None and batch_size is not None and len(prompt) != batch_size:
+            raise ValueError(f"Prompt batch mismatch: len(prompt)={len(prompt)} vs batch={batch_size}")
+        if action is not None and num_video_frames is not None and action.shape[1] % (num_video_frames - 1) != 0:
+            raise ValueError(
+                "`sample['action']` temporal dimension must be divisible by "
+                f"video frames-1={num_video_frames - 1}, got {action.shape[1]}"
+            )
 
         if history_dino_latents is not None:
             if not isinstance(history_dino_latents, torch.Tensor):
@@ -489,10 +545,12 @@ class Wan22Trainer:
                     "`sample['history_dino_latents']` must be [D,T,H,W] or [B,D,T,H,W], "
                     f"got {tuple(history_dino_latents.shape)}"
                 )
-            if history_dino_latents.shape[0] != video.shape[0]:
+            if batch_size is None:
+                batch_size = int(history_dino_latents.shape[0])
+            elif history_dino_latents.shape[0] != batch_size:
                 raise ValueError(
-                    "Eval history DINO latent/video batch mismatch: "
-                    f"history={tuple(history_dino_latents.shape)} video={tuple(video.shape)}"
+                    "Eval history DINO latent batch mismatch: "
+                    f"history={tuple(history_dino_latents.shape)} batch={batch_size}"
                 )
 
         if action_is_pad is not None:
@@ -518,11 +576,13 @@ class Wan22Trainer:
             "proprio": proprio,
             "context": context,
             "context_mask": context_mask,
+            "vae_latents": vae_latents,
             "dino_latents": dino_latents,
             "history_dino_latents": history_dino_latents,
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
             "action_horizon": action_horizon,
+            "video_frame_count": num_video_frames,
         }
 
     def _compute_eval_action_metrics(self, sample, pred_action, gt_action):
@@ -605,7 +665,7 @@ class Wan22Trainer:
         dino_backbone_loaded = True
         if dino_encoder is not None:
             dino_backbone_loaded = bool(getattr(dino_encoder, "_loaded", False))
-        if hasattr(model, "infer_action") and not dino_backbone_loaded:
+        if sample["video"] is None or (hasattr(model, "infer_action") and not dino_backbone_loaded):
             local_metrics = torch.tensor(
                 [float(val_loss)],
                 device=self.accelerator.device,

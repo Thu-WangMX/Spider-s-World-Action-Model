@@ -47,6 +47,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         dino_latent_cache_dir: Optional[str] = None,
         dino_latent_cache_mode: str = "window",
         dino_latent_cache_required: bool = False,
+        vae_latent_cache_dir: Optional[str] = None,
+        vae_latent_cache_mode: str = "window_mmap",
+        vae_latent_cache_required: bool = False,
+        skip_video_load_if_latent_cached: bool = False,
         load_history_dino_latents: bool = False,
         history_dino_frame_offsets: Optional[list[int]] = None,
         history_dino_latent_cache_required: Optional[bool] = None,
@@ -71,7 +75,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
 
         self.camera_key = camera_key
-        self.lerobot_dataset._set_return_images(True)
 
         self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
@@ -81,6 +84,25 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
         self.load_text_context = load_text_context
+        self.vae_latent_cache_dir = vae_latent_cache_dir
+        self.vae_latent_cache_mode = str(vae_latent_cache_mode).strip().lower()
+        if self.vae_latent_cache_mode not in {"window", "window_mmap"}:
+            raise ValueError(
+                f"`vae_latent_cache_mode` must be 'window' or 'window_mmap', got {vae_latent_cache_mode}"
+            )
+        self.vae_latent_cache_required = bool(vae_latent_cache_required)
+        self.skip_video_load_if_latent_cached = bool(skip_video_load_if_latent_cached)
+        if self.skip_video_load_if_latent_cached:
+            if self.vae_latent_cache_dir is None or str(self.vae_latent_cache_dir).strip() == "":
+                raise ValueError(
+                    "`skip_video_load_if_latent_cached=true` requires `vae_latent_cache_dir`."
+                )
+            if not self.vae_latent_cache_required:
+                raise ValueError(
+                    "`skip_video_load_if_latent_cached=true` requires "
+                    "`vae_latent_cache_required=true`."
+                )
+        self.lerobot_dataset._set_return_images(not self.skip_video_load_if_latent_cached)
         self.dino_latent_cache_dir = dino_latent_cache_dir
         self.dino_latent_cache_mode = str(dino_latent_cache_mode).strip().lower()
         if self.dino_latent_cache_mode not in {"window", "frame", "frame_mmap"}:
@@ -113,6 +135,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self._dino_frame_mmap_np_dtype = None
         self._dino_frame_mmap_torch_dtype = None
         self._dino_frame_mmap_shape = None
+        self._vae_window_mmap = None
+        self._vae_window_mmap_path = None
+        self._vae_window_mmap_np_dtype = None
+        self._vae_window_mmap_torch_dtype = None
+        self._vae_window_mmap_shape = None
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -163,6 +190,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             return None
         return os.path.join(str(self.dino_latent_cache_dir), "frames", f"{int(idx):08d}.pt")
 
+    def _get_vae_latent_cache_path(self, idx: int) -> Optional[str]:
+        if self.vae_latent_cache_dir is None or str(self.vae_latent_cache_dir).strip() == "":
+            return None
+        return os.path.join(str(self.vae_latent_cache_dir), f"{int(idx):08d}.pt")
+
     def _get_global_indices_for_offsets(self, idx: int, offsets: list[int]) -> list[int]:
         episode_to = self.lerobot_dataset.episode_data_index["to"]
         episode_idx = int(torch.searchsorted(episode_to, torch.tensor(int(idx)), right=True).item())
@@ -178,6 +210,20 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
     def _get_history_dino_global_indices(self, idx: int) -> list[int]:
         return self._get_global_indices_for_offsets(idx, self.history_dino_frame_offsets)
+
+    @staticmethod
+    def _mmap_dtype_from_metadata(metadata: dict, metadata_path: str, cache_name: str):
+        save_dtype = str(metadata.get("save_dtype", "bf16")).strip().lower()
+        storage_dtype = str(metadata.get("storage_dtype", "")).strip().lower()
+        if save_dtype in {"bf16", "bfloat16"}:
+            if storage_dtype and storage_dtype != "uint16":
+                raise ValueError(f"{cache_name} bf16 mmap cache must use uint16 storage, got {storage_dtype}")
+            return np.uint16, torch.bfloat16
+        if save_dtype in {"fp16", "float16"}:
+            return np.float16, torch.float16
+        if save_dtype in {"fp32", "float32"}:
+            return np.float32, torch.float32
+        raise ValueError(f"Unsupported {cache_name} mmap save_dtype={save_dtype!r} in {metadata_path}")
 
     def _load_cached_dino_latents(self, idx: int) -> Optional[torch.Tensor]:
         if self.dino_latent_cache_mode == "frame":
@@ -349,6 +395,139 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             )
         return latent.permute(1, 0, 2, 3).contiguous()  # [D, T, H, W]
 
+    def _load_cached_vae_latents(self, idx: int) -> Optional[torch.Tensor]:
+        if self.vae_latent_cache_mode == "window_mmap":
+            return self._load_cached_vae_window_mmap_latents(idx)
+
+        cache_path = self._get_vae_latent_cache_path(idx)
+        if cache_path is None:
+            return None
+        if not os.path.exists(cache_path):
+            if self.vae_latent_cache_required:
+                raise FileNotFoundError(
+                    f"Missing VAE latent cache for dataset idx={idx}: {cache_path}. "
+                    "Run scripts/precompute_vae_latents.py first, or disable "
+                    "`vae_latent_cache_required`."
+                )
+            return None
+
+        payload = torch.load(cache_path, map_location="cpu")
+        latents = payload.get("vae_latents", payload.get("latents")) if isinstance(payload, dict) else payload
+        if latents is None:
+            raise KeyError(f"VAE latent cache missing `vae_latents`: {cache_path}")
+        if not torch.is_tensor(latents):
+            raise TypeError(f"Cached VAE latents must be a tensor, got {type(latents)} in {cache_path}")
+        if latents.ndim != 4:
+            raise ValueError(
+                f"Cached VAE latents must be [C,T,H,W] for one sample, "
+                f"got shape {tuple(latents.shape)} in {cache_path}"
+            )
+        return latents.contiguous()
+
+    def _open_vae_window_mmap(self):
+        if self._vae_window_mmap is not None:
+            return
+        if self.vae_latent_cache_dir is None or str(self.vae_latent_cache_dir).strip() == "":
+            return
+
+        metadata_path = os.path.join(str(self.vae_latent_cache_dir), "metadata.json")
+        if not os.path.exists(metadata_path):
+            if self.vae_latent_cache_required:
+                raise FileNotFoundError(f"Missing VAE window mmap metadata: {metadata_path}")
+            return
+
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        if str(metadata.get("cache_mode", "")).strip().lower() != "window_mmap":
+            raise ValueError(
+                f"VAE mmap cache metadata must have cache_mode='window_mmap', got "
+                f"{metadata.get('cache_mode')!r} in {metadata_path}"
+            )
+        complete_marker = os.path.join(str(self.vae_latent_cache_dir), ".complete")
+        if not bool(metadata.get("complete", False)) or not os.path.exists(complete_marker):
+            if self.vae_latent_cache_required:
+                raise RuntimeError(
+                    f"VAE mmap cache is incomplete: metadata_complete={metadata.get('complete')!r}, "
+                    f"complete_marker_exists={os.path.exists(complete_marker)} in {self.vae_latent_cache_dir}"
+                )
+            return
+
+        expected = {
+            "num_frames": int(self.num_frames),
+            "action_video_freq_ratio": int(self.action_video_freq_ratio),
+            "video_sample_count": len(self.video_sample_indices),
+            "concat_multi_camera": self.concat_multi_camera,
+        }
+        if "data_video_size" in metadata:
+            expected["data_video_size"] = [int(self.video_size[0]), int(self.video_size[1])]
+        for key, expected_value in expected.items():
+            if key not in metadata:
+                continue
+            actual_value = metadata[key]
+            if actual_value != expected_value:
+                raise ValueError(
+                    f"VAE mmap metadata mismatch for {key}: cache={actual_value!r}, "
+                    f"dataset={expected_value!r} in {metadata_path}"
+                )
+
+        mmap_file = metadata.get("mmap_file", "latents.bf16.bin")
+        mmap_path = os.path.join(str(self.vae_latent_cache_dir), str(mmap_file))
+        if not os.path.exists(mmap_path):
+            if self.vae_latent_cache_required:
+                raise FileNotFoundError(f"Missing VAE window mmap payload: {mmap_path}")
+            return
+
+        total_samples = int(metadata["total_samples"])
+        latent_shape = tuple(int(v) for v in metadata["latent_shape"])
+        if total_samples < len(self.lerobot_dataset):
+            raise ValueError(
+                f"VAE mmap cache has fewer samples than dataset: cache={total_samples}, "
+                f"dataset={len(self.lerobot_dataset)} in {metadata_path}"
+            )
+        np_dtype, torch_dtype = self._mmap_dtype_from_metadata(metadata, metadata_path, "VAE")
+        expected_bytes = int(total_samples * np.prod(latent_shape) * np.dtype(np_dtype).itemsize)
+        actual_bytes = os.path.getsize(mmap_path)
+        if actual_bytes != expected_bytes:
+            raise ValueError(
+                f"VAE mmap payload size mismatch: file={actual_bytes} bytes, "
+                f"expected={expected_bytes} bytes from shape={(total_samples, *latent_shape)} "
+                f"and dtype={np_dtype} in {mmap_path}"
+            )
+
+        self._vae_window_mmap_path = mmap_path
+        self._vae_window_mmap_np_dtype = np_dtype
+        self._vae_window_mmap_torch_dtype = torch_dtype
+        self._vae_window_mmap_shape = (total_samples, *latent_shape)
+        self._vae_window_mmap = np.memmap(
+            mmap_path,
+            mode="r",
+            dtype=np_dtype,
+            shape=self._vae_window_mmap_shape,
+        )
+
+    def _load_cached_vae_window_mmap_latents(self, idx: int) -> Optional[torch.Tensor]:
+        self._open_vae_window_mmap()
+        if self._vae_window_mmap is None:
+            return None
+
+        total_samples = int(self._vae_window_mmap_shape[0])
+        if idx < 0 or idx >= total_samples:
+            raise IndexError(
+                f"VAE window mmap index out of bounds for dataset idx={idx}: total_samples={total_samples}"
+            )
+
+        latent_np = np.asarray(self._vae_window_mmap[int(idx)])
+        if self._vae_window_mmap_torch_dtype is torch.bfloat16:
+            latent = torch.from_numpy(np.array(latent_np, copy=True)).view(torch.bfloat16)
+        else:
+            latent = torch.from_numpy(np.array(latent_np, copy=True)).to(dtype=self._vae_window_mmap_torch_dtype)
+        if latent.ndim != 4:
+            raise ValueError(
+                f"VAE window mmap slice must be [C,T,H,W], got {tuple(latent.shape)} "
+                f"from {self._vae_window_mmap_path}"
+            )
+        return latent.contiguous()
+
     def _load_cached_history_dino_latents(self, idx: int) -> Optional[torch.Tensor]:
         if not self.load_history_dino_latents:
             return None
@@ -402,75 +581,79 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         resolved_sample_idx = int(sample.get("idx", sample_idx))
         
-        image_is_pad = sample["image_is_pad"]
+        image_is_pad = sample["image_is_pad"][self.video_sample_indices]
+        video = None
+        video_frame_count = len(self.video_sample_indices)
 
-        video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
-        num_cameras = 1
-        if video.ndim == 5:
-            video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
-            num_cameras, T_video, C, H, W = video.shape
-        else:
-            assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
-            video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
-            T_video, C, H, W = video.shape
-        image_is_pad = image_is_pad[self.video_sample_indices]
-
-        video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
-        if self.concat_multi_camera == "robotwin":
-            if num_cameras != 3:
-                raise ValueError(
-                    f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"
-                )
-            cam_top = transforms_F.resize(
-                video[0],
-                size=[256, 320],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 256, 320]
-            cam_left = transforms_F.resize(
-                video[1],
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 128, 160]
-            cam_right = transforms_F.resize(
-                video[2],
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 128, 160]
-            bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
-            video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
-        elif num_cameras > 1:
-            if self.concat_multi_camera == "horizontal":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
-            elif self.concat_multi_camera == "vertical":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)  # [T_video, C, num_cameras*H, W]
+        if not self.skip_video_load_if_latent_cached:
+            video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
+            num_cameras = 1
+            if video.ndim == 5:
+                video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
+                num_cameras, T_video, C, H, W = video.shape
             else:
-                raise ValueError(
-                    f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
-                    "Expected one of: horizontal, vertical, robotwin."
-                )
-        else:
-            video = video.squeeze(0)  # [T_video, C, H, W]
+                assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
+                video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
+                T_video, C, H, W = video.shape
+            video_frame_count = int(T_video)
 
-        # final resize and normalization
-        video = self.resize_transform(video)
-        video = self.crop_transform(video)
-        video = self.normalize_transform(video)  # [T_video, C, H, W]
+            video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
+            if self.concat_multi_camera == "robotwin":
+                if num_cameras != 3:
+                    raise ValueError(
+                        f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"
+                    )
+                cam_top = transforms_F.resize(
+                    video[0],
+                    size=[256, 320],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR,
+                    antialias=True,
+                )  # [T_video, C, 256, 320]
+                cam_left = transforms_F.resize(
+                    video[1],
+                    size=[128, 160],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR,
+                    antialias=True,
+                )  # [T_video, C, 128, 160]
+                cam_right = transforms_F.resize(
+                    video[2],
+                    size=[128, 160],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR,
+                    antialias=True,
+                )  # [T_video, C, 128, 160]
+                bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
+                video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
+            elif num_cameras > 1:
+                if self.concat_multi_camera == "horizontal":
+                    video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
+                elif self.concat_multi_camera == "vertical":
+                    video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)  # [T_video, C, num_cameras*H, W]
+                else:
+                    raise ValueError(
+                        f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
+                        "Expected one of: horizontal, vertical, robotwin."
+                    )
+            else:
+                video = video.squeeze(0)  # [T_video, C, H, W]
 
-        video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
+            # final resize and normalization
+            video = self.resize_transform(video)
+            video = self.crop_transform(video)
+            video = self.normalize_transform(video)  # [T_video, C, H, W]
+
+            video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
 
         # Proxy (from lerobot): 
         #   action: [num_frames-1, action_dim] # start from t0, except the last frame
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
         action = sample["action"] # [T-1, action_dim]
         proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
-        if video.shape[1] <= 1:
-            raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
-        if action.shape[0] % (video.shape[1] - 1) != 0:
+        if video_frame_count <= 1:
+            raise ValueError(f"`video` must have at least 2 frames, got T={video_frame_count}")
+        if action.shape[0] % (video_frame_count - 1) != 0:
             raise ValueError(
-                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
+                f"`action` horizon must be divisible by `video` transitions, got "
+                f"{action.shape[0]} and {video_frame_count - 1}"
             )
 
         task = sample["instruction"]
@@ -488,7 +671,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         
         data = {
             "dataset_idx": resolved_sample_idx,
-            "video": video,
+            "video_frame_count": video_frame_count,
             "action": action,
             "proprio": proprio,
             "prompt": instruction,
@@ -496,16 +679,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if video is not None:
+            data["video"] = video
         if self.load_text_context:
             data["context"] = context
             data["context_mask"] = context_mask
 
+        vae_latents = self._load_cached_vae_latents(resolved_sample_idx)
+        if vae_latents is not None:
+            data["vae_latents"] = vae_latents
+
         dino_latents = self._load_cached_dino_latents(resolved_sample_idx)
         if dino_latents is not None:
-            if dino_latents.shape[1] != video.shape[1]:
+            if dino_latents.shape[1] != video_frame_count:
                 raise ValueError(
                     f"Cached DINO latent temporal length mismatch for idx={resolved_sample_idx}: "
-                    f"cache T={dino_latents.shape[1]}, video T={video.shape[1]}"
+                    f"cache T={dino_latents.shape[1]}, video T={video_frame_count}"
                 )
             data["dino_latents"] = dino_latents
         history_dino_latents = self._load_cached_history_dino_latents(resolved_sample_idx)
@@ -557,7 +746,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         try:
             data = self._get(idx)
         except Exception as e:
-            if self.dino_latent_cache_required:
+            if self.dino_latent_cache_required or self.vae_latent_cache_required:
                 raise
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
             # trace back

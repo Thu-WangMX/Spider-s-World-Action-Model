@@ -442,6 +442,46 @@ class FastWAMVAEDinoMoT(nn.Module):
             tile_stride=tile_stride,
         )
 
+    def _validate_vae_latent_shape(
+        self,
+        latents: torch.Tensor,
+        *,
+        video_frame_count: Optional[int] = None,
+    ) -> None:
+        if latents.ndim != 5:
+            raise ValueError(f"VAE latents must be 5D [B,C,T,H,W], got shape {tuple(latents.shape)}")
+        expected_dim = getattr(self.vae, "z_dim", None)
+        if expected_dim is None:
+            vae_model = getattr(self.vae, "model", None)
+            expected_dim = getattr(vae_model, "z_dim", latents.shape[1])
+        expected_dim = int(expected_dim)
+        if latents.shape[1] != expected_dim:
+            raise ValueError(
+                f"VAE latent channel mismatch: cache C={latents.shape[1]}, model C={expected_dim}."
+            )
+        if video_frame_count is not None:
+            temporal_factor = int(self.vae.temporal_downsample_factor)
+            if (int(video_frame_count) - 1) % temporal_factor != 0:
+                raise ValueError(
+                    "Selected video frame count is incompatible with Wan VAE latent downsampling: "
+                    f"T={video_frame_count}, temporal_downsample_factor={temporal_factor}."
+                )
+            expected_t = (int(video_frame_count) - 1) // temporal_factor + 1
+            if latents.shape[2] != expected_t:
+                raise ValueError(
+                    f"VAE latent temporal mismatch: cache T={latents.shape[2]}, expected T={expected_t} "
+                    f"from selected video T={video_frame_count}."
+                )
+        if self.dino_encoder is not None:
+            input_h, input_w = self.dino_encoder.input_resolution
+            vae_factor = int(getattr(self.vae, "upsampling_factor", 16))
+            expected_hw = (input_h // vae_factor, input_w // vae_factor)
+            if tuple(latents.shape[-2:]) != expected_hw:
+                raise ValueError(
+                    "VAE latent spatial shape mismatch: "
+                    f"cache={(latents.shape[-2], latents.shape[-1])}, expected={expected_hw}."
+                )
+
     @torch.no_grad()
     def _encode_input_image_latents_tensor(
         self,
@@ -496,12 +536,15 @@ class FastWAMVAEDinoMoT(nn.Module):
     def build_inputs(self, sample: dict, tiled: bool = False) -> dict[str, Any]:
         if "context" not in sample or "context_mask" not in sample:
             raise ValueError("FastWAMVAEDinoMoT training requires `context` and `context_mask`.")
-        if "video" not in sample:
-            raise ValueError("FastWAMVAEDinoMoT training requires RGB `video` for the VAE branch.")
         if "action" not in sample:
             raise ValueError("FastWAMVAEDinoMoT training requires `action`.")
 
-        video = sample["video"]
+        video = sample.get("video", None)
+        vae_latents = sample.get("vae_latents", None)
+        if video is None and vae_latents is None:
+            raise ValueError(
+                "FastWAMVAEDinoMoT training requires either RGB `video` or cached `vae_latents`."
+            )
         action = sample["action"]
         context = sample["context"]
         context_mask = sample["context_mask"]
@@ -518,32 +561,24 @@ class FastWAMVAEDinoMoT(nn.Module):
                 "`model.intent_config.enabled=true`."
             )
 
-        if video.ndim != 5 or video.shape[1] != 3:
-            raise ValueError(f"`video` must be 5D [B,3,T,H,W], got shape {tuple(video.shape)}")
         if action.ndim != 3:
             raise ValueError(f"`action` must be 3D [B,T,A], got shape {tuple(action.shape)}")
-        batch_size = video.shape[0]
+        batch_size = action.shape[0]
         temporal_factor = int(self.vae.temporal_downsample_factor)
         if temporal_factor <= 0:
             raise ValueError(f"`vae.temporal_downsample_factor` must be positive, got {temporal_factor}.")
-        if action.shape[0] != batch_size:
-            raise ValueError(f"Batch mismatch between video and action: {batch_size} vs {action.shape[0]}")
-        if video.shape[2] <= 1:
-            raise ValueError(f"`video` must include f0 plus future frames, got T={video.shape[2]}")
-        if (video.shape[2] - 1) % temporal_factor != 0:
-            raise ValueError(
-                "RGB video temporal length is incompatible with Wan VAE latent downsampling: "
-                f"T={video.shape[2]}, temporal_downsample_factor={temporal_factor}. "
-                "Expected (T - 1) % temporal_downsample_factor == 0."
-            )
-        if action.shape[1] % (video.shape[2] - 1) != 0:
-            raise ValueError(
-                "`action` temporal dimension must be divisible by video transitions: "
-                f"action_T={action.shape[1]}, video_T={video.shape[2]}."
-            )
 
-        input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        input_vae_latents = self._encode_video_latents(input_video, tiled=tiled)
+        input_video = None
+        video_frame_count = None
+        if video is not None:
+            if video.ndim != 5 or video.shape[1] != 3:
+                raise ValueError(f"`video` must be 5D [B,3,T,H,W], got shape {tuple(video.shape)}")
+            if video.shape[0] != batch_size:
+                raise ValueError(f"Batch mismatch between video and action: {video.shape[0]} vs {batch_size}")
+            if video.shape[2] <= 1:
+                raise ValueError(f"`video` must include f0 plus future frames, got T={video.shape[2]}")
+            video_frame_count = int(video.shape[2])
+            input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
 
         if "dino_latents" in sample and sample["dino_latents"] is not None:
             input_dino_latents = sample["dino_latents"]
@@ -553,7 +588,7 @@ class FastWAMVAEDinoMoT(nn.Module):
                 )
             if input_dino_latents.shape[0] != batch_size:
                 raise ValueError(
-                    f"Batch mismatch between `dino_latents` and video: {input_dino_latents.shape[0]} vs {batch_size}"
+                    f"Batch mismatch between `dino_latents` and action: {input_dino_latents.shape[0]} vs {batch_size}"
                 )
             self._validate_dino_latent_shape(input_dino_latents)
             input_dino_latents = input_dino_latents.to(
@@ -561,7 +596,14 @@ class FastWAMVAEDinoMoT(nn.Module):
                 dtype=self.torch_dtype,
                 non_blocking=True,
             )
+            if video_frame_count is None:
+                video_frame_count = int(input_dino_latents.shape[2])
         else:
+            if input_video is None:
+                raise ValueError(
+                    "Missing `dino_latents` while RGB `video` is omitted. "
+                    "Latent-only training requires cached DINO latents."
+                )
             if not bool(getattr(self.dino_encoder, "_loaded", False)):
                 raise ValueError(
                     "Missing `dino_latents` while DINO backbone loading is disabled. "
@@ -570,11 +612,52 @@ class FastWAMVAEDinoMoT(nn.Module):
                 )
             input_dino_latents = self._encode_video_dino(input_video)
             self._validate_dino_latent_shape(input_dino_latents)
+            video_frame_count = int(input_dino_latents.shape[2])
 
-        if input_dino_latents.shape[2] != video.shape[2]:
+        if video_frame_count is None:
+            raise ValueError("Unable to infer selected video frame count from RGB video or DINO latents.")
+        if video_frame_count <= 1:
+            raise ValueError(f"`video` must include f0 plus future frames, got T={video_frame_count}")
+        if (video_frame_count - 1) % temporal_factor != 0:
             raise ValueError(
-                "DINO latent temporal length must match RGB video frames for the three-branch mask, "
-                f"got dino_T={input_dino_latents.shape[2]}, video_T={video.shape[2]}."
+                "Selected video frame count is incompatible with Wan VAE latent downsampling: "
+                f"T={video_frame_count}, temporal_downsample_factor={temporal_factor}. "
+                "Expected (T - 1) % temporal_downsample_factor == 0."
+            )
+        if action.shape[1] % (video_frame_count - 1) != 0:
+            raise ValueError(
+                "`action` temporal dimension must be divisible by video transitions: "
+                f"action_T={action.shape[1]}, video_T={video_frame_count}."
+            )
+
+        if vae_latents is not None:
+            input_vae_latents = vae_latents
+            if input_vae_latents.ndim == 4:
+                input_vae_latents = input_vae_latents.unsqueeze(0)
+            if input_vae_latents.ndim != 5:
+                raise ValueError(
+                    f"`vae_latents` must be 5D [B,C,T,H,W], got shape {tuple(input_vae_latents.shape)}"
+                )
+            if input_vae_latents.shape[0] != batch_size:
+                raise ValueError(
+                    f"Batch mismatch between `vae_latents` and action: {input_vae_latents.shape[0]} vs {batch_size}"
+                )
+            self._validate_vae_latent_shape(input_vae_latents, video_frame_count=video_frame_count)
+            input_vae_latents = input_vae_latents.to(
+                device=self.device,
+                dtype=self.torch_dtype,
+                non_blocking=True,
+            )
+        else:
+            if input_video is None:
+                raise ValueError("Missing cached `vae_latents` while RGB `video` is omitted.")
+            input_vae_latents = self._encode_video_latents(input_video, tiled=tiled)
+            self._validate_vae_latent_shape(input_vae_latents, video_frame_count=video_frame_count)
+
+        if input_dino_latents.shape[2] != video_frame_count:
+            raise ValueError(
+                "DINO latent temporal length must match selected video frame count for the three-branch mask, "
+                f"got dino_T={input_dino_latents.shape[2]}, video_T={video_frame_count}."
             )
 
         if context.ndim != 3 or context_mask.ndim != 2:
@@ -622,7 +705,7 @@ class FastWAMVAEDinoMoT(nn.Module):
                 )
             if history_dino_latents.shape[0] != batch_size:
                 raise ValueError(
-                    f"Batch mismatch between `history_dino_latents` and video: "
+                    f"Batch mismatch between `history_dino_latents` and action batch: "
                     f"{history_dino_latents.shape[0]} vs {batch_size}"
                 )
             intent_tokens = self._encode_history_intent(history_dino_latents)
@@ -637,6 +720,15 @@ class FastWAMVAEDinoMoT(nn.Module):
             action_is_pad = action_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
         if image_is_pad is not None:
             image_is_pad = image_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
+            if image_is_pad.ndim != 2 or image_is_pad.shape[0] != batch_size:
+                raise ValueError(
+                    f"`image_is_pad` must be [B,T_video], got shape {tuple(image_is_pad.shape)}"
+                )
+            if image_is_pad.shape[1] != video_frame_count:
+                raise ValueError(
+                    f"`image_is_pad` temporal length must match selected video frame count: "
+                    f"mask_T={image_is_pad.shape[1]}, video_T={video_frame_count}."
+                )
 
         return {
             "context": context,

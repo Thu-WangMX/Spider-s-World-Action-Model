@@ -45,6 +45,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         self.past_action_size = past_action_size
         self.obs_size = obs_size
         self.processor = None  # Will be set externally
+        self.return_images = True
         metas = []
         for ds_dir in dataset_dirs:
             ds_root = Path(ds_dir)
@@ -219,8 +220,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         for meta in self.action_meta:
             sample["action"][meta["key"]] = self._get_action(meta, lerobot_sample)
 
-        for meta in self.image_meta:
-            sample["images"][meta["key"]] = self._get_image(meta, lerobot_sample)
+        if self.return_images:
+            for meta in self.image_meta:
+                sample["images"][meta["key"]] = self._get_image(meta, lerobot_sample)
 
         sample["action_is_pad"] = lerobot_sample[f"{self.action_meta[0]['lerobot_key']}_is_pad"]
         sample["state_is_pad"] = lerobot_sample[f"{self.state_meta[0]['lerobot_key']}_is_pad"]

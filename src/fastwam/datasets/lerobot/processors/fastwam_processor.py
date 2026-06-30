@@ -17,22 +17,22 @@ class FastWAMProcessor(BaseProcessor):
         # keys
         shape_meta: Dict[str, Any],
         num_obs_steps: int,
-        num_output_cameras: int, 
+        num_output_cameras: int,
         action_output_dim: int,
         proprio_output_dim: int,
 
-        action_state_transforms: Optional[List[Any]], 
+        action_state_transforms: Optional[List[Any]],
 
         # action & state normalization
         use_stepwise_action_norm: bool,
         norm_default_mode: NormMode,
-        norm_exception_mode: Dict[str, Dict[str, NormMode]], 
+        norm_exception_mode: Dict[str, Dict[str, NormMode]],
 
-        action_state_merger, 
+        action_state_merger,
 
         # image transform
         train_transforms: Dict[str, List[Any]] | None,
-        val_transforms: Dict[str, List[Any]] | None, 
+        val_transforms: Dict[str, List[Any]] | None,
 
         # instruction transform
         drop_high_level_prob: float = 1.0,
@@ -141,9 +141,9 @@ class FastWAMProcessor(BaseProcessor):
 
         if np.random.rand() < self.drop_high_level_prob:
             instruction = f"{low_level_instruction}"
-        else: 
+        else:
             instruction = f"[High]: {high_level_instruction}, [Low]: {low_level_instruction}"
-        
+
         return instruction
 
     def action_state_transform(self, batch):
@@ -153,36 +153,36 @@ class FastWAMProcessor(BaseProcessor):
                 actual_shape = batch["action"][k].shape[-1]
                 assert actual_shape == meta_shape, \
                     f"Action key {k} actual raw shape {actual_shape} mismatch with meta raw shape {meta_shape}."
-                    
+
         for meta in self.shape_meta["state"]:
             k, meta_shape = meta["key"], meta["raw_shape"]
             actual_shape = batch["state"][k].shape[-1]
             assert actual_shape == meta_shape, \
                 f"State key {k} actual raw shape {actual_shape} mismatch with meta raw shape {meta_shape}."
-        
-        if self.action_state_transforms is not None: 
+
+        if self.action_state_transforms is not None:
             for trans in self.action_state_transforms:
                 batch = trans.forward(batch)
-        
+
         if "action" in batch:
             for meta in self.shape_meta["action"]:
                 k, meta_shape = meta["key"], meta["shape"]
                 actual_shape = batch["action"][k].shape[-1]
                 assert actual_shape == meta_shape, \
                     f"Action key {k} actual transformed shape {actual_shape} mismatch with meta shape {meta_shape}."
-        
+
         for meta in self.shape_meta["state"]:
             k, meta_shape = meta["key"], meta["shape"]
             actual_shape = batch["state"][k].shape[-1]
             assert actual_shape == meta_shape, \
                 f"State key {k} actual transformed shape {actual_shape} mismatch with meta raw shape {meta_shape}."
-        
+
         return batch
 
     def preprocess(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Preprocess the data for the policy model.
-        
+
         Args:
             Data: Dict[str, Any], lerobot sample in raw mcap obtained from dataset __getitem__:
                 - "action": Optional, Dict[str, torch.Tensor] -> [action_horizon, action_dim]
@@ -192,7 +192,7 @@ class FastWAMProcessor(BaseProcessor):
                 - "state_is_pad": torch.Tensor -> [num_obs_steps,]
                 - "image_is_pad": torch.Tensor -> [num_obs_steps,]
                 - "idx": int, sample index
-                
+
         Returns:
             Sample: Dict[str, Any], which can collated:
                 - "input_ids": torch.Tensor -> [max_image_text_tokens,]
@@ -211,38 +211,41 @@ class FastWAMProcessor(BaseProcessor):
         sample["instruction"] = self.augment_instruction(data)
         sample["image_is_pad"] = data["image_is_pad"]
 
-        # 2. image
-        processed_images = []
-        for meta in self.shape_meta["images"]:
-            key, shape = meta["key"], meta["shape"]
-            image = data["images"][key]  # [num_obs_steps, C, H, W]
-            assert image.ndim == 4, f"Expected 4 dimensions (num_obs_steps, C, H, W), got shape {image.shape}"
-            
-            # Apply transforms efficiently on the merged batch
-            transforms = self.train_transforms if self.is_train else self.val_transforms
-            current_transforms = transforms[key] if isinstance(transforms, dict) else transforms
-            for trans in current_transforms:
-                image = trans(image)
-            
-            meta_shape = [self.num_obs_steps] + shape
-            assert image.shape == meta_shape, \
-                f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
+        # 2. image. Latent-only training disables image loading upstream and
+        # relies on cached VAE/DINO latents, while still using this processor
+        # for instruction/action/state normalization.
+        if data.get("images"):
+            processed_images = []
+            for meta in self.shape_meta["images"]:
+                key, shape = meta["key"], meta["shape"]
+                image = data["images"][key]  # [num_obs_steps, C, H, W]
+                assert image.ndim == 4, f"Expected 4 dimensions (num_obs_steps, C, H, W), got shape {image.shape}"
 
-            processed_images.append(image)
-        pixel_values = torch.stack(processed_images, dim=0) # [num_input_cameras, T, C, H, W]
-        
-        if self.num_output_cameras > pixel_values.shape[0]:
-            out = torch.zeros((self.num_output_cameras,) + pixel_values.shape[1:], device=pixel_values.device, dtype=pixel_values.dtype)
-            out[0: pixel_values.shape[0]] = pixel_values
-            sample["pixel_values"] = out
-        elif self.num_output_cameras < pixel_values.shape[0]:
-            logger.warning(f"num_output_cameras {self.num_output_cameras} is less than the number of cameras in data {pixel_values.shape[0]}, "
-                           f"truncating the input to the first {self.num_output_cameras} cameras.")
-            sample["pixel_values"] = pixel_values[:self.num_output_cameras]
-        else:
-            sample["pixel_values"] = pixel_values
+                # Apply transforms efficiently on the merged batch
+                transforms = self.train_transforms if self.is_train else self.val_transforms
+                current_transforms = transforms[key] if isinstance(transforms, dict) else transforms
+                for trans in current_transforms:
+                    image = trans(image)
 
-        # Copy action before transform for open-loop evaluation, 
+                meta_shape = [self.num_obs_steps] + shape
+                assert image.shape == meta_shape, \
+                    f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
+
+                processed_images.append(image)
+            pixel_values = torch.stack(processed_images, dim=0) # [num_input_cameras, T, C, H, W]
+
+            if self.num_output_cameras > pixel_values.shape[0]:
+                out = torch.zeros((self.num_output_cameras,) + pixel_values.shape[1:], device=pixel_values.device, dtype=pixel_values.dtype)
+                out[0: pixel_values.shape[0]] = pixel_values
+                sample["pixel_values"] = out
+            elif self.num_output_cameras < pixel_values.shape[0]:
+                logger.warning(f"num_output_cameras {self.num_output_cameras} is less than the number of cameras in data {pixel_values.shape[0]}, "
+                               f"truncating the input to the first {self.num_output_cameras} cameras.")
+                sample["pixel_values"] = pixel_values[:self.num_output_cameras]
+            else:
+                sample["pixel_values"] = pixel_values
+
+        # Copy action before transform for open-loop evaluation,
         # disabled for training dataset as it may cause collating key problem.
         if not self.is_train and "action" in data:
             sample["gt_action"] = deepcopy(data["action"])
@@ -266,9 +269,9 @@ class FastWAMProcessor(BaseProcessor):
             sample["action_is_pad"] = data["action_is_pad"] # [action_horizon,]
             sample["action_dim_is_pad"] = data["action_dim_is_pad"] # [action_dim,]
             assert sample["action"].shape[-1] == self.action_output_dim
-            # sample["action"][sample["action_is_pad"], :-1] = 0.0 # NOTE: we assume use delta_eef_pose + gripper， so pad action is 0
+            # NOTE: padded action entries are assumed to be zero.
 
-        
+
         # TODO: rename all "state" into "proprio"
         sample["proprio"] = data["state"] # [num_obs_steps, proprio_dim]
         sample["proprio_is_pad"] = data["state_is_pad"] # [num_obs_steps,]
@@ -278,13 +281,13 @@ class FastWAMProcessor(BaseProcessor):
         sample["idx"] = data["idx"]
 
         # sample = self.tokenizer(sample)
-        
+
         return sample
 
     def postprocess(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Postprocess the data for the policy model.
-        
+
         Args:
             data: Dict[str, Any], lerobot sample in raw mcap
 
