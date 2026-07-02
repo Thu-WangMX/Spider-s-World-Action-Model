@@ -6,6 +6,7 @@ cd "${ROOT_DIR}"
 
 PYTHON="${PYTHON:-/data73/mingxinwang/conda_envs/spiderwam/bin/python}"
 TASK="${TASK:-robotwin_wan5b_dino_s_aux_mot_3cam_384x320_1e-4}"
+VERIFY_TASK="${VERIFY_TASK:-robotwin_wan5b_dino_s_aux_mot_short_intent_3cam_384x320_1e-4}"
 FRAME_CACHE_DIR="${FRAME_CACHE_DIR:-./data/dino_latents_cache/robotwin_dino_s_3cam384x320_pool1x1_frame}"
 MMAP_CACHE_DIR="${MMAP_CACHE_DIR:-./data/dino_latents_cache/robotwin_dino_s_3cam384x320_pool1x1_frame_mmap}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -121,7 +122,7 @@ run_verify() {
   log "Stage=verify mmap cache=${MMAP_CACHE_DIR}"
   require_file "${MMAP_CACHE_DIR}/metadata.json" "Robotwin mmap cache metadata"
 
-  MMAP_CACHE_DIR="${MMAP_CACHE_DIR}" "${PYTHON}" - <<'PY' 2>&1 | tee -a "${LOG_FILE}"
+  VERIFY_TASK="${VERIFY_TASK}" MMAP_CACHE_DIR="${MMAP_CACHE_DIR}" "${PYTHON}" - <<'PY' 2>&1 | tee -a "${LOG_FILE}"
 import os
 from pathlib import Path
 
@@ -131,8 +132,9 @@ from omegaconf import OmegaConf
 
 root = Path.cwd()
 config_dir = str(root / "configs")
-task = "robotwin_wan5b_dino_s_aux_mot_short_intent_3cam_384x320_1e-4"
+task = os.environ["VERIFY_TASK"]
 mmap_cache_dir = os.environ["MMAP_CACHE_DIR"]
+print("verify_task", task)
 with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
     cfg = compose(
         config_name="train",

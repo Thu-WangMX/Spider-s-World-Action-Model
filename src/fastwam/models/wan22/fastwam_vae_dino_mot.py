@@ -71,6 +71,12 @@ class FastWAMVAEDinoMoT(nn.Module):
         self.dino_encoder = dino_encoder
         self.intent_encoder = intent_encoder
         self.intent_config = dict(intent_config or {})
+        self.intent_source = str(self.intent_config.get("source", "dino")).strip().lower()
+        if self.intent_source not in {"dino", "vae"}:
+            raise ValueError(
+                f"Unsupported `intent_config.source={self.intent_source!r}`; "
+                "expected one of: dino, vae."
+            )
         self.intent_injection_mode = str(
             self.intent_config.get("injection_mode", "context_after_proprio")
         )
@@ -82,6 +88,7 @@ class FastWAMVAEDinoMoT(nn.Module):
             )
         if self.intent_encoder is not None:
             self.intent_config["injection_mode"] = self.intent_injection_mode
+            self.intent_config["source"] = self.intent_source
         history_offsets = self.intent_config.get("history_offsets", None)
         self.intent_history_frame_count = (
             len(history_offsets)
@@ -233,6 +240,13 @@ class FastWAMVAEDinoMoT(nn.Module):
                     "`context_after_proprio`."
                 )
             intent_config["injection_mode"] = injection_mode
+            intent_source = str(intent_config.get("source", "dino")).strip().lower()
+            if intent_source not in {"dino", "vae"}:
+                raise ValueError(
+                    f"Unsupported `intent_config.source={intent_source!r}` for FastWAMVAEDinoMoT; "
+                    "expected one of: dino, vae."
+                )
+            intent_config["source"] = intent_source
             history_offsets = intent_config.get(
                 "history_offsets",
                 intent_config.get("history_dino_frame_offsets", [-8, -4, 0]),
@@ -250,8 +264,13 @@ class FastWAMVAEDinoMoT(nn.Module):
                     f"got {max_history_frames} vs {len(history_offsets)}."
                 )
             intent_config["max_history_frames"] = max_history_frames
+            intent_input_dim = (
+                int(getattr(components.vae, "z_dim", 48))
+                if intent_source == "vae"
+                else int(dino_config.get("feature_dim", 1024))
+            )
             intent_encoder = DINOHistoryIntentResampler(
-                dino_dim=int(dino_config.get("feature_dim", 1024)),
+                dino_dim=intent_input_dim,
                 text_dim=text_dim,
                 num_intent_tokens=int(intent_config.get("num_intent_tokens", 8)),
                 resampler_dim=int(intent_config.get("resampler_dim", 1024)),
@@ -407,30 +426,31 @@ class FastWAMVAEDinoMoT(nn.Module):
             torch.cat([context_mask, intent_mask], dim=1),
         )
 
-    def _encode_history_intent(self, history_dino_latents: torch.Tensor) -> torch.Tensor:
+    def _encode_history_intent(self, history_latents: torch.Tensor) -> torch.Tensor:
         if self.intent_encoder is None:
             raise ValueError("`intent_encoder` is not enabled for this model.")
-        if history_dino_latents.ndim != 5:
+        if history_latents.ndim != 5:
             raise ValueError(
-                f"`history_dino_latents` must be [B,D,T,H,W], got "
-                f"{tuple(history_dino_latents.shape)}"
+                f"History intent latents must be [B,D,T,H,W], got {tuple(history_latents.shape)}"
             )
         if (
             self.intent_history_frame_count is not None
-            and history_dino_latents.shape[2] != self.intent_history_frame_count
+            and history_latents.shape[2] != self.intent_history_frame_count
         ):
             raise ValueError(
-                "`history_dino_latents` temporal length does not match "
-                f"`intent_config.history_offsets`: got T={history_dino_latents.shape[2]}, "
-                f"expected {self.intent_history_frame_count}."
+                "History intent temporal length does not match `intent_config.history_offsets`: "
+                f"got T={history_latents.shape[2]}, expected {self.intent_history_frame_count}."
             )
-        self._validate_dino_latent_shape(history_dino_latents)
-        history_dino_latents = history_dino_latents.to(
+        if self.intent_source == "vae":
+            self._validate_vae_history_latent_shape(history_latents)
+        else:
+            self._validate_dino_latent_shape(history_latents)
+        history_latents = history_latents.to(
             device=self.device,
             dtype=self.torch_dtype,
             non_blocking=True,
         )
-        return self.intent_encoder(history_dino_latents)
+        return self.intent_encoder(history_latents)
 
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
@@ -481,6 +501,34 @@ class FastWAMVAEDinoMoT(nn.Module):
                     "VAE latent spatial shape mismatch: "
                     f"cache={(latents.shape[-2], latents.shape[-1])}, expected={expected_hw}."
                 )
+
+    def _validate_vae_history_latent_shape(self, latents: torch.Tensor) -> None:
+        self._validate_vae_latent_shape(latents, video_frame_count=None)
+
+    @torch.no_grad()
+    def _encode_history_vae_video(self, history_video: torch.Tensor, tiled: bool = False) -> torch.Tensor:
+        if history_video.ndim != 5:
+            raise ValueError(
+                f"`history_video` must be [B,3,T,H,W] for VAE intent, got {tuple(history_video.shape)}"
+            )
+        if history_video.shape[1] != 3:
+            raise ValueError(f"`history_video` channel dim must be 3, got {history_video.shape[1]}")
+        latents = []
+        history_video = history_video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        for frame_idx in range(int(history_video.shape[2])):
+            frame_video = history_video[:, :, frame_idx:frame_idx + 1]
+            frame_latents = self._encode_video_latents(frame_video, tiled=tiled)
+            self._validate_vae_latent_shape(frame_latents, video_frame_count=1)
+            if frame_latents.shape[2] != 1:
+                raise ValueError(
+                    f"Expected single-frame VAE encode to produce latent T=1, got {frame_latents.shape[2]}"
+                )
+            latents.append(frame_latents[:, :, 0])
+        if not latents:
+            raise ValueError("`history_video` must contain at least one frame for VAE intent.")
+        history_latents = torch.stack(latents, dim=2).contiguous()
+        self._validate_vae_history_latent_shape(history_latents)
+        return history_latents
 
     @torch.no_grad()
     def _encode_input_image_latents_tensor(
@@ -552,12 +600,17 @@ class FastWAMVAEDinoMoT(nn.Module):
         action_is_pad = sample.get("action_is_pad", None)
         image_is_pad = sample.get("image_is_pad", None)
         history_dino_latents = sample.get("history_dino_latents", None)
+        history_vae_latents = sample.get("history_vae_latents", None)
         history_video = sample.get("history_video", None)
 
-        if self.intent_encoder is None and (history_dino_latents is not None or history_video is not None):
+        if self.intent_encoder is None and (
+            history_dino_latents is not None
+            or history_vae_latents is not None
+            or history_video is not None
+        ):
             raise ValueError(
                 "FastWAMVAEDinoMoT does not consume short-intent history tokens. "
-                "Disable `data.train.load_history_dino_latents` for this config, or enable "
+                "Disable history inputs for this config, or enable "
                 "`model.intent_config.enabled=true`."
             )
 
@@ -680,35 +733,93 @@ class FastWAMVAEDinoMoT(nn.Module):
             )
 
         if self.intent_encoder is not None:
-            if history_dino_latents is not None and history_video is not None:
-                raise ValueError("Provide only one of `history_dino_latents` or `history_video`.")
-            if history_dino_latents is None:
-                if history_video is None:
+            if self.intent_source == "vae":
+                if history_dino_latents is not None:
                     raise ValueError(
-                        "`history_dino_latents` is required when `intent_config.enabled=true` "
-                        "for 3-MOT training. Enable `data.train.load_history_dino_latents=true`."
+                        "`history_dino_latents` was provided but `intent_config.source='vae'`. "
+                        "Disable `data.train.load_history_dino_latents` for this config."
                     )
-                if history_video.ndim != 5:
+                if history_vae_latents is not None and history_video is not None:
+                    raise ValueError("Provide only one of `history_vae_latents` or `history_video`.")
+                if history_vae_latents is None:
+                    if history_video is None:
+                        raise ValueError(
+                            "`history_video` or `history_vae_latents` is required when "
+                            "`intent_config.enabled=true` and `intent_config.source='vae'`. "
+                            "Enable `data.train.load_history_vae_video=true`."
+                        )
+                    if history_video.ndim != 5:
+                        raise ValueError(
+                            "`history_video` must be [B,3,T,H,W] when used for VAE intent training, "
+                            f"got {tuple(history_video.shape)}"
+                        )
+                    if history_video.shape[0] != batch_size:
+                        raise ValueError(
+                            f"Batch mismatch between `history_video` and action batch: "
+                            f"{history_video.shape[0]} vs {batch_size}"
+                        )
+                    history_vae_latents = self._encode_history_vae_video(history_video, tiled=tiled)
+                elif history_vae_latents.ndim == 4:
+                    history_vae_latents = history_vae_latents.unsqueeze(0)
+                if history_vae_latents.ndim != 5:
                     raise ValueError(
-                        "`history_video` must be [B,3,T,H,W] when used for training, "
-                        f"got {tuple(history_video.shape)}"
+                        f"`history_vae_latents` must be 5D [B,C,T,H,W], got "
+                        f"{tuple(history_vae_latents.shape)}"
                     )
-                history_dino_latents = self._encode_video_dino(
-                    history_video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-                )
-            elif history_dino_latents.ndim == 4:
-                history_dino_latents = history_dino_latents.unsqueeze(0)
-            if history_dino_latents.ndim != 5:
-                raise ValueError(
-                    f"`history_dino_latents` must be 5D [B,D,T,H,W], got "
-                    f"{tuple(history_dino_latents.shape)}"
-                )
-            if history_dino_latents.shape[0] != batch_size:
-                raise ValueError(
-                    f"Batch mismatch between `history_dino_latents` and action batch: "
-                    f"{history_dino_latents.shape[0]} vs {batch_size}"
-                )
-            intent_tokens = self._encode_history_intent(history_dino_latents)
+                if history_vae_latents.shape[0] != batch_size:
+                    raise ValueError(
+                        f"Batch mismatch between `history_vae_latents` and action batch: "
+                        f"{history_vae_latents.shape[0]} vs {batch_size}"
+                    )
+                intent_tokens = self._encode_history_intent(history_vae_latents)
+            else:
+                if history_vae_latents is not None:
+                    raise ValueError(
+                        "`history_vae_latents` was provided but `intent_config.source='dino'`."
+                    )
+                if history_dino_latents is not None and history_video is not None:
+                    raise ValueError("Provide only one of `history_dino_latents` or `history_video`.")
+                if history_dino_latents is None:
+                    if history_video is None:
+                        raise ValueError(
+                            "`history_dino_latents` or `history_video` is required when "
+                            "`intent_config.enabled=true` and `intent_config.source='dino'` "
+                            "for 3-MOT training. Enable `data.train.load_history_dino_latents=true` "
+                            "for cached history DINO latents, or `data.train.load_history_dino_video=true` "
+                            "for online history DINO encoding."
+                        )
+                    if history_video.ndim != 5:
+                        raise ValueError(
+                            "`history_video` must be [B,3,T,H,W] when used for training, "
+                            f"got {tuple(history_video.shape)}"
+                        )
+                    if history_video.shape[0] != batch_size:
+                        raise ValueError(
+                            f"Batch mismatch between `history_video` and action batch: "
+                            f"{history_video.shape[0]} vs {batch_size}"
+                        )
+                    if not bool(getattr(self.dino_encoder, "_loaded", False)):
+                        raise ValueError(
+                            "Online DINO intent history encoding requires "
+                            "`model.dino_config.load_backbone=true`."
+                        )
+                    history_dino_latents = self._encode_video_dino(
+                        history_video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+                    )
+                elif history_dino_latents.ndim == 4:
+                    history_dino_latents = history_dino_latents.unsqueeze(0)
+                if history_dino_latents.ndim != 5:
+                    raise ValueError(
+                        f"`history_dino_latents` must be 5D [B,D,T,H,W], got "
+                        f"{tuple(history_dino_latents.shape)}"
+                    )
+                if history_dino_latents.shape[0] != batch_size:
+                    raise ValueError(
+                        f"Batch mismatch between `history_dino_latents` and action batch: "
+                        f"{history_dino_latents.shape[0]} vs {batch_size}"
+                    )
+                intent_tokens = self._encode_history_intent(history_dino_latents)
+
             context, context_mask = self._append_intent_to_context(
                 context=context,
                 context_mask=context_mask,
@@ -1070,10 +1181,15 @@ class FastWAMVAEDinoMoT(nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
         history_dino_latents: Optional[torch.Tensor] = None,
+        history_vae_latents: Optional[torch.Tensor] = None,
         history_video: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         self.eval()
-        if self.intent_encoder is None and (history_dino_latents is not None or history_video is not None):
+        if self.intent_encoder is None and (
+            history_dino_latents is not None
+            or history_vae_latents is not None
+            or history_video is not None
+        ):
             raise ValueError(
                 "FastWAMVAEDinoMoT does not consume short-intent history tokens. "
                 "Disable history inputs for this config, or enable `model.intent_config.enabled=true`."
@@ -1135,24 +1251,17 @@ class FastWAMVAEDinoMoT(nn.Module):
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         if self.intent_encoder is not None:
-            if history_dino_latents is not None and history_video is not None:
-                raise ValueError("Provide only one of `history_dino_latents` or `history_video`.")
-            if history_dino_latents is not None:
-                if history_dino_latents.ndim == 4:
-                    history_dino_latents = history_dino_latents.unsqueeze(0)
-                history_dino_latents = history_dino_latents.to(
-                    device=self.device,
-                    dtype=self.torch_dtype,
-                    non_blocking=True,
-                )
-            elif history_video is not None:
+            if history_video is not None:
                 if history_video.ndim == 4:
-                    if history_video.shape[1] != 3:
+                    if history_video.shape[0] == 3:
+                        history_video = history_video.unsqueeze(0).contiguous()
+                    elif history_video.shape[1] == 3:
+                        history_video = history_video.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
+                    else:
                         raise ValueError(
-                            f"`history_video` as [T,3,H,W] must have channel dim=3, "
+                            f"`history_video` must be [3,T,H,W] or [T,3,H,W], "
                             f"got {tuple(history_video.shape)}"
                         )
-                    history_video = history_video.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
                 elif history_video.ndim == 5:
                     if history_video.shape[0] != 1:
                         raise ValueError(f"`history_video` batch must be 1, got {history_video.shape[0]}")
@@ -1167,27 +1276,77 @@ class FastWAMVAEDinoMoT(nn.Module):
                         )
                 else:
                     raise ValueError(
-                        f"`history_video` must be 4D or 5D, got "
-                        f"{tuple(history_video.shape)}"
+                        f"`history_video` must be 4D or 5D, got {tuple(history_video.shape)}"
                     )
                 history_video = history_video.to(device=self.device, dtype=self.torch_dtype)
-                history_dino_latents = self._encode_video_dino(history_video)
-            elif bool(self.intent_config.get("infer_repeat_current_if_missing", False)):
-                history_count = len(
-                    self.intent_config.get(
-                        "history_offsets",
-                        self.intent_config.get("history_dino_frame_offsets", [-8, -4, 0]),
+
+            if self.intent_source == "vae":
+                if history_dino_latents is not None:
+                    raise ValueError(
+                        "`history_dino_latents` was provided but `intent_config.source='vae'`."
                     )
-                )
-                history_dino_latents = first_frame_dino_latents.expand(
-                    -1, -1, history_count, -1, -1
-                )
+                if history_vae_latents is not None and history_video is not None:
+                    raise ValueError("Provide only one of `history_vae_latents` or `history_video`.")
+                if history_vae_latents is not None:
+                    if history_vae_latents.ndim == 4:
+                        history_vae_latents = history_vae_latents.unsqueeze(0)
+                    history_vae_latents = history_vae_latents.to(
+                        device=self.device,
+                        dtype=self.torch_dtype,
+                        non_blocking=True,
+                    )
+                elif history_video is not None:
+                    history_vae_latents = self._encode_history_vae_video(history_video, tiled=tiled)
+                elif bool(self.intent_config.get("infer_repeat_current_if_missing", False)):
+                    history_count = len(
+                        self.intent_config.get(
+                            "history_offsets",
+                            self.intent_config.get("history_dino_frame_offsets", [-8, -4, 0]),
+                        )
+                    )
+                    history_vae_latents = first_frame_vae_latents.expand(
+                        -1, -1, history_count, -1, -1
+                    )
+                else:
+                    raise ValueError(
+                        "`history_vae_latents` or `history_video` is required for inference when "
+                        "`intent_config.enabled=true` and `intent_config.source='vae'`."
+                    )
+                intent_tokens = self._encode_history_intent(history_vae_latents)
             else:
-                raise ValueError(
-                    "`history_dino_latents` or `history_video` is required for inference when "
-                    "`intent_config.enabled=true`."
-                )
-            intent_tokens = self._encode_history_intent(history_dino_latents)
+                if history_vae_latents is not None:
+                    raise ValueError(
+                        "`history_vae_latents` was provided but `intent_config.source='dino'`."
+                    )
+                if history_dino_latents is not None and history_video is not None:
+                    raise ValueError("Provide only one of `history_dino_latents` or `history_video`.")
+                if history_dino_latents is not None:
+                    if history_dino_latents.ndim == 4:
+                        history_dino_latents = history_dino_latents.unsqueeze(0)
+                    history_dino_latents = history_dino_latents.to(
+                        device=self.device,
+                        dtype=self.torch_dtype,
+                        non_blocking=True,
+                    )
+                elif history_video is not None:
+                    history_dino_latents = self._encode_video_dino(history_video)
+                elif bool(self.intent_config.get("infer_repeat_current_if_missing", False)):
+                    history_count = len(
+                        self.intent_config.get(
+                            "history_offsets",
+                            self.intent_config.get("history_dino_frame_offsets", [-8, -4, 0]),
+                        )
+                    )
+                    history_dino_latents = first_frame_dino_latents.expand(
+                        -1, -1, history_count, -1, -1
+                    )
+                else:
+                    raise ValueError(
+                        "`history_dino_latents` or `history_video` is required for inference when "
+                        "`intent_config.enabled=true`."
+                    )
+                intent_tokens = self._encode_history_intent(history_dino_latents)
+
             context, context_mask = self._append_intent_to_context(
                 context=context,
                 context_mask=context_mask,
@@ -1254,7 +1413,7 @@ class FastWAMVAEDinoMoT(nn.Module):
                 "Checkpoint intent injection_mode mismatch: "
                 f"checkpoint={checkpoint_mode!r}, current={current_mode!r}."
             )
-        for key in ("history_offsets", "max_history_frames", "num_intent_tokens"):
+        for key in ("source", "history_offsets", "max_history_frames", "num_intent_tokens"):
             if key in checkpoint_config and key in self.intent_config:
                 if checkpoint_config[key] != self.intent_config[key]:
                     raise ValueError(

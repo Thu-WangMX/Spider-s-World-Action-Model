@@ -240,33 +240,76 @@ class Wan22Trainer:
                 f"got {max_history_frames} and {len(model_offsets)}."
             )
 
+        intent_source = str(intent_config.get("source", "dino")).strip().lower()
+        if intent_source not in {"dino", "vae"}:
+            raise ValueError(
+                f"Unsupported `model.intent_config.source={intent_source!r}`; "
+                "expected one of: dino, vae."
+            )
+
         datasets = [("train_dataset", self.train_dataset)]
         if self.val_dataset is not None:
             datasets.append(("val_dataset", self.val_dataset))
         for dataset_name, dataset in datasets:
-            load_history = bool(getattr(dataset, "load_history_dino_latents", False))
-            if not load_history:
-                raise ValueError(
-                    f"{dataset_name} must set `load_history_dino_latents=true` when "
-                    "`model.intent_config.enabled=true`."
+            if intent_source == "vae":
+                load_history = bool(getattr(dataset, "load_history_vae_video", False))
+                if not load_history:
+                    raise ValueError(
+                        f"{dataset_name} must set `load_history_vae_video=true` when "
+                        "`model.intent_config.enabled=true` and `model.intent_config.source='vae'`."
+                    )
+                dataset_offsets = getattr(dataset, "history_vae_frame_offsets", None)
+                offset_attr = "history_vae_frame_offsets"
+                intent_name = "Short-VAE-Intent"
+            else:
+                load_history_latents = bool(getattr(dataset, "load_history_dino_latents", False))
+                load_history_video = bool(getattr(dataset, "load_history_dino_video", False))
+                legacy_load_history_video = bool(getattr(dataset, "load_history_vae_video", False))
+                history_source_count = sum(
+                    int(flag)
+                    for flag in (load_history_latents, load_history_video, legacy_load_history_video)
                 )
-            dataset_offsets = getattr(dataset, "history_dino_frame_offsets", None)
+                if history_source_count != 1:
+                    raise ValueError(
+                        f"{dataset_name} should provide exactly one DINO intent history source: "
+                        "`load_history_dino_latents=true` for cached latents, or "
+                        "`load_history_dino_video=true` for online DINO encoding."
+                    )
+                if load_history_latents:
+                    dataset_offsets = getattr(dataset, "history_dino_frame_offsets", None)
+                    offset_attr = "history_dino_frame_offsets"
+                elif load_history_video:
+                    dataset_offsets = getattr(dataset, "history_dino_frame_offsets", None)
+                    offset_attr = "history_dino_frame_offsets"
+                elif legacy_load_history_video:
+                    dataset_offsets = getattr(dataset, "history_vae_frame_offsets", None)
+                    offset_attr = "history_vae_frame_offsets"
+                else:
+                    raise ValueError(
+                        f"{dataset_name} must set `load_history_dino_latents=true` for cached "
+                        "history DINO latents, or `load_history_dino_video=true` for online "
+                        "history DINO encoding, when `model.intent_config.enabled=true` and "
+                        "`model.intent_config.source='dino'`."
+                    )
+                intent_name = "Short-DINO-Intent"
+
             if dataset_offsets is None:
                 raise ValueError(
-                    f"{dataset_name} has no `history_dino_frame_offsets`; cannot verify "
-                    "Short-DINO-Intent train/infer consistency."
+                    f"{dataset_name} has no `{offset_attr}`; cannot verify "
+                    f"{intent_name} train/infer consistency."
                 )
             dataset_offsets = [int(offset) for offset in dataset_offsets]
             if dataset_offsets != model_offsets:
                 raise ValueError(
-                    "Short-DINO-Intent history offset mismatch between model and dataset: "
+                    f"{intent_name} history offset mismatch between model and dataset: "
                     f"model.intent_config.history_offsets={model_offsets}, "
-                    f"{dataset_name}.history_dino_frame_offsets={dataset_offsets}."
+                    f"{dataset_name}.{offset_attr}={dataset_offsets}."
                 )
 
         if self.accelerator.is_main_process:
             logger.info(
-                "Short-DINO-Intent history offsets verified: offsets=%s max_history_frames=%d",
+                "Short-%s-Intent history offsets verified: offsets=%s max_history_frames=%d",
+                intent_source.upper(),
                 model_offsets,
                 max_history_frames,
             )
@@ -398,6 +441,8 @@ class Wan22Trainer:
         vae_latents = sample.get("vae_latents", None)
         dino_latents = sample.get("dino_latents", None)
         history_dino_latents = sample.get("history_dino_latents", None)
+        history_vae_latents = sample.get("history_vae_latents", None)
+        history_video = sample.get("history_video", None)
         action_is_pad = sample.get("action_is_pad", None)
         image_is_pad = sample.get("image_is_pad", None)
 
@@ -553,6 +598,52 @@ class Wan22Trainer:
                     f"history={tuple(history_dino_latents.shape)} batch={batch_size}"
                 )
 
+        if history_vae_latents is not None:
+            if not isinstance(history_vae_latents, torch.Tensor):
+                raise TypeError(
+                    f"`sample['history_vae_latents']` must be a torch.Tensor, "
+                    f"got {type(history_vae_latents)}"
+                )
+            if history_vae_latents.ndim == 4:
+                history_vae_latents = history_vae_latents.unsqueeze(0)
+            if history_vae_latents.ndim != 5:
+                raise ValueError(
+                    "`sample['history_vae_latents']` must be [C,T,H,W] or [B,C,T,H,W], "
+                    f"got {tuple(history_vae_latents.shape)}"
+                )
+            if batch_size is None:
+                batch_size = int(history_vae_latents.shape[0])
+            elif history_vae_latents.shape[0] != batch_size:
+                raise ValueError(
+                    "Eval history VAE latent batch mismatch: "
+                    f"history={tuple(history_vae_latents.shape)} batch={batch_size}"
+                )
+
+        if history_video is not None:
+            if not isinstance(history_video, torch.Tensor):
+                raise TypeError(
+                    f"`sample['history_video']` must be a torch.Tensor, got {type(history_video)}"
+                )
+            if history_video.ndim == 4:
+                history_video = history_video.unsqueeze(0)
+            if history_video.ndim != 5:
+                raise ValueError(
+                    "`sample['history_video']` must be [C,T,H,W] or [B,C,T,H,W], "
+                    f"got {tuple(history_video.shape)}"
+                )
+            if history_video.shape[1] != 3:
+                raise ValueError(
+                    f"`sample['history_video']` channel dim must be 3 after batching, "
+                    f"got {tuple(history_video.shape)}"
+                )
+            if batch_size is None:
+                batch_size = int(history_video.shape[0])
+            elif history_video.shape[0] != batch_size:
+                raise ValueError(
+                    "Eval history video batch mismatch: "
+                    f"history={tuple(history_video.shape)} batch={batch_size}"
+                )
+
         if action_is_pad is not None:
             if not isinstance(action_is_pad, torch.Tensor):
                 action_is_pad = torch.as_tensor(action_is_pad, dtype=torch.bool)
@@ -579,6 +670,8 @@ class Wan22Trainer:
             "vae_latents": vae_latents,
             "dino_latents": dino_latents,
             "history_dino_latents": history_dino_latents,
+            "history_vae_latents": history_vae_latents,
+            "history_video": history_video,
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
             "action_horizon": action_horizon,
@@ -703,6 +796,10 @@ class Wan22Trainer:
                 infer_kwargs["prompt"] = prompt
             if sample.get("history_dino_latents") is not None:
                 infer_kwargs["history_dino_latents"] = sample["history_dino_latents"][0]
+            elif sample.get("history_vae_latents") is not None:
+                infer_kwargs["history_vae_latents"] = sample["history_vae_latents"][0]
+            elif sample.get("history_video") is not None:
+                infer_kwargs["history_video"] = sample["history_video"]
 
             pred = model.infer_action(**infer_kwargs)
             action_metrics = self._compute_eval_action_metrics(sample, pred.get("action"), action)

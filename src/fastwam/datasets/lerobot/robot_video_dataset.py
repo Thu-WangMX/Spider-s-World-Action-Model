@@ -54,6 +54,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         load_history_dino_latents: bool = False,
         history_dino_frame_offsets: Optional[list[int]] = None,
         history_dino_latent_cache_required: Optional[bool] = None,
+        load_history_dino_video: bool = False,
+        load_history_vae_video: bool = False,
+        history_vae_frame_offsets: Optional[list[int]] = None,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -118,6 +121,21 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             raise ValueError(
                 "`history_dino_frame_offsets` must contain at least one offset when "
                 "`load_history_dino_latents=true`."
+            )
+        self.load_history_dino_video = bool(load_history_dino_video)
+        if self.load_history_dino_video and len(self.history_dino_frame_offsets) == 0:
+            raise ValueError(
+                "`history_dino_frame_offsets` must contain at least one offset when "
+                "`load_history_dino_video=true`."
+            )
+        self.load_history_vae_video = bool(load_history_vae_video)
+        if history_vae_frame_offsets is None:
+            history_vae_frame_offsets = self.history_dino_frame_offsets
+        self.history_vae_frame_offsets = [int(offset) for offset in history_vae_frame_offsets]
+        if self.load_history_vae_video and len(self.history_vae_frame_offsets) == 0:
+            raise ValueError(
+                "`history_vae_frame_offsets` must contain at least one offset when "
+                "`load_history_vae_video=true`."
             )
         self.history_dino_latent_cache_required = (
             bool(dino_latent_cache_required)
@@ -210,6 +228,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
     def _get_history_dino_global_indices(self, idx: int) -> list[int]:
         return self._get_global_indices_for_offsets(idx, self.history_dino_frame_offsets)
+
+    def _get_history_vae_global_indices(self, idx: int) -> list[int]:
+        return self._get_global_indices_for_offsets(idx, self.history_vae_frame_offsets)
 
     @staticmethod
     def _mmap_dtype_from_metadata(metadata: dict, metadata_path: str, cache_name: str):
@@ -554,6 +575,107 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             )
         return history
 
+    def _format_pixel_values_video(self, video: torch.Tensor, frame_indices: list[int]) -> torch.Tensor:
+        """Format processor pixel_values into [C,T,H,W] in the same layout as main video."""
+        num_cameras = 1
+        if video.ndim == 5:
+            video = video[:, frame_indices, :, :, :]  # [num_cameras, T, C, H, W]
+            num_cameras, t_video, c, h, w = video.shape
+        else:
+            assert video.ndim == 4, f"Expected pixel_values [T,C,H,W] or [N,T,C,H,W], got {video.shape}"
+            video = video[frame_indices, :, :, :]
+            t_video, c, h, w = video.shape
+        video = video.view(num_cameras, t_video, c, h, w)
+
+        if self.concat_multi_camera == "robotwin":
+            if num_cameras != 3:
+                raise ValueError(
+                    f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"
+                )
+            cam_top = transforms_F.resize(
+                video[0],
+                size=[256, 320],
+                interpolation=transforms_F.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            cam_left = transforms_F.resize(
+                video[1],
+                size=[128, 160],
+                interpolation=transforms_F.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            cam_right = transforms_F.resize(
+                video[2],
+                size=[128, 160],
+                interpolation=transforms_F.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            bottom = torch.cat([cam_left, cam_right], dim=-1)
+            video = torch.cat([cam_top, bottom], dim=-2)
+        elif num_cameras > 1:
+            if self.concat_multi_camera == "horizontal":
+                video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)
+            elif self.concat_multi_camera == "vertical":
+                video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)
+            else:
+                raise ValueError(
+                    f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
+                    "Expected one of: horizontal, vertical, robotwin."
+                )
+        else:
+            video = video.squeeze(0)
+
+        video = self.resize_transform(video)
+        video = self.crop_transform(video)
+        video = self.normalize_transform(video)
+        return video.permute(1, 0, 2, 3).contiguous()
+
+    def _load_history_video_frames(self, idx: int, frame_indices: list[int], history_name: str) -> torch.Tensor:
+        previous_return_images = bool(self.lerobot_dataset.return_images)
+        frames = []
+        try:
+            if not previous_return_images:
+                self.lerobot_dataset._set_return_images(True)
+            for frame_idx in frame_indices:
+                history_sample = self.lerobot_dataset[int(frame_idx)]
+                resolved_idx = int(history_sample.get("idx", frame_idx))
+                if resolved_idx != int(frame_idx):
+                    raise RuntimeError(
+                        f"{history_name} loading requires deterministic dataset indexing, "
+                        f"but requested idx={frame_idx} resolved to idx={resolved_idx}."
+                    )
+                if "pixel_values" not in history_sample:
+                    raise KeyError(
+                        f"{history_name} loading requires `pixel_values`; "
+                        "failed to temporarily enable image loading."
+                    )
+                frame_video = self._format_pixel_values_video(history_sample["pixel_values"], [0])
+                if frame_video.shape[1] != 1:
+                    raise ValueError(
+                        f"Expected one formatted history frame, got T={frame_video.shape[1]}"
+                    )
+                frames.append(frame_video[:, 0])
+        finally:
+            if not previous_return_images:
+                self.lerobot_dataset._set_return_images(False)
+        if len(frames) != len(frame_indices):
+            raise RuntimeError(
+                f"Loaded {len(frames)} {history_name} frames, expected {len(frame_indices)} for idx={idx}."
+            )
+        return torch.stack(frames, dim=1).contiguous()  # [C, T_history, H, W]
+
+    def _load_history_dino_video(self, idx: int) -> Optional[torch.Tensor]:
+        if not self.load_history_dino_video:
+            return None
+        frame_indices = self._get_history_dino_global_indices(idx)
+        return self._load_history_video_frames(idx, frame_indices, "History DINO video")
+
+    def _load_history_vae_video(self, idx: int) -> Optional[torch.Tensor]:
+        if not self.load_history_vae_video:
+            return None
+        frame_indices = self._get_history_vae_global_indices(idx)
+        return self._load_history_video_frames(idx, frame_indices, "History VAE video")
+
     def _get(self, idx):
         sample_idx = idx
         sample = None
@@ -706,6 +828,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     f"cache T={history_dino_latents.shape[1]}, expected T={expected_t}"
                 )
             data["history_dino_latents"] = history_dino_latents
+
+        history_video = self._load_history_dino_video(resolved_sample_idx)
+        history_offsets = self.history_dino_frame_offsets
+        history_name = "History DINO video"
+        if history_video is None:
+            history_video = self._load_history_vae_video(resolved_sample_idx)
+            history_offsets = self.history_vae_frame_offsets
+            history_name = "History VAE video"
+        if history_video is not None:
+            expected_t = len(history_offsets)
+            if history_video.shape[1] != expected_t:
+                raise ValueError(
+                    f"{history_name} temporal length mismatch for idx={resolved_sample_idx}: "
+                    f"video T={history_video.shape[1]}, expected T={expected_t}"
+                )
+            data["history_video"] = history_video
         return data
 
     def _get_cached_text_context(self, prompt: str):
