@@ -38,6 +38,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         val_set_proportion=0.05,
         is_training_set=False,
         global_sample_stride=1,
+        episode_filter: Optional[str] = None,
+        robotwin_split_block_size: int = 550,
+        robotwin_clean_episodes_per_block: int = 50,
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
@@ -51,6 +54,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         vae_latent_cache_mode: str = "window_mmap",
         vae_latent_cache_required: bool = False,
         skip_video_load_if_latent_cached: bool = False,
+        allow_latent_cache_with_episode_filter: bool = False,
         load_history_dino_latents: bool = False,
         history_dino_frame_offsets: Optional[list[int]] = None,
         history_dino_latent_cache_required: Optional[bool] = None,
@@ -66,6 +70,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
+            episode_filter=episode_filter,
+            robotwin_split_block_size=robotwin_split_block_size,
+            robotwin_clean_episodes_per_block=robotwin_clean_episodes_per_block,
         )
     
         self.num_frames = num_frames
@@ -113,6 +120,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 f"`dino_latent_cache_mode` must be 'window', 'frame', or 'frame_mmap', got {dino_latent_cache_mode}"
             )
         self.dino_latent_cache_required = dino_latent_cache_required
+        self.allow_latent_cache_with_episode_filter = bool(allow_latent_cache_with_episode_filter)
+        self._assert_episode_filter_cache_safe()
         self.load_history_dino_latents = bool(load_history_dino_latents)
         if history_dino_frame_offsets is None:
             history_dino_frame_offsets = [-8, -4, 0]
@@ -194,6 +203,24 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)
+
+    def _assert_episode_filter_cache_safe(self) -> None:
+        episode_filter = getattr(self.lerobot_dataset, "episode_filter", None)
+        if episode_filter is None or self.allow_latent_cache_with_episode_filter:
+            return
+        active_cache_dirs = []
+        if self.dino_latent_cache_dir is not None and str(self.dino_latent_cache_dir).strip() != "":
+            active_cache_dirs.append("dino_latent_cache_dir")
+        if self.vae_latent_cache_dir is not None and str(self.vae_latent_cache_dir).strip() != "":
+            active_cache_dirs.append("vae_latent_cache_dir")
+        if not active_cache_dirs:
+            return
+        raise ValueError(
+            f"`episode_filter={episode_filter}` reindexes dataset frame ids, so full-dataset "
+            f"latent caches can become misaligned: {active_cache_dirs}. Use online encoding, "
+            "or regenerate caches for the same filtered dataset and set "
+            "`allow_latent_cache_with_episode_filter=true` explicitly."
+        )
         
     def __len__(self):
         return len(self.lerobot_dataset)

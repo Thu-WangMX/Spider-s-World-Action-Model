@@ -103,6 +103,49 @@ def _resolve_ckpt_tag(ckpt_path: Path) -> str:
     return ckpt_path.stem
 
 
+def _infer_task_from_ckpt_path(ckpt_path: Path) -> str | None:
+    parts = ckpt_path.resolve().parts
+    if "runs" not in parts:
+        return None
+    runs_idx = parts.index("runs")
+    if runs_idx + 1 >= len(parts):
+        return None
+    task_name = parts[runs_idx + 1]
+    return task_name or None
+
+
+def _has_explicit_task_override() -> bool:
+    for raw_override in HydraConfig.get().overrides.task:
+        key = raw_override.split("=", 1)[0].lstrip("+~")
+        if key == "task":
+            return True
+    return False
+
+
+def _resolve_sim_task_for_ckpt(ckpt_path: Path) -> str | None:
+    runtime_task = HydraConfig.get().runtime.choices.get("task")
+    inferred_task = _infer_task_from_ckpt_path(ckpt_path)
+    if inferred_task is None:
+        return runtime_task
+
+    if _has_explicit_task_override():
+        if runtime_task != inferred_task:
+            raise ValueError(
+                "RoboTwin eval task mismatch: "
+                f"Hydra task={runtime_task!r}, but ckpt path implies {inferred_task!r}. "
+                "Use the checkpoint's training task, or move the checkpoint outside runs/<task>/<run>."
+            )
+        return runtime_task
+
+    if runtime_task != inferred_task:
+        print(
+            f"[robotwin_eval] auto using checkpoint task {inferred_task!r} "
+            f"instead of sim_robotwin default {runtime_task!r}.",
+            flush=True,
+        )
+    return inferred_task
+
+
 def _ensure_policy_symlink(robotwin_root: Path, policy_source_dir: Path) -> Path:
     policy_root = robotwin_root / "policy"
     if not policy_root.is_dir():
@@ -193,7 +236,7 @@ def main(cfg: DictConfig):
     )
 
     sim_cfg_path = (PROJECT_ROOT / "configs" / "sim_robotwin.yaml").resolve()
-    sim_task = HydraConfig.get().runtime.choices.get("task")
+    sim_task = _resolve_sim_task_for_ckpt(ckpt_path)
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg, ckpt_path)
 

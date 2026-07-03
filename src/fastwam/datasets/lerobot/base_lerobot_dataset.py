@@ -33,6 +33,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # sampling
         global_sample_stride: int = 1,
+
+        # optional episode subset filtering
+        episode_filter: Optional[str] = None,
+        robotwin_split_block_size: int = 550,
+        robotwin_clean_episodes_per_block: int = 50,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -86,21 +91,35 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             meta["lerobot_key"] = f"action.{key}" if key != "default" else "action"
             delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
+        self.episode_filter = self._normalize_episode_filter(episode_filter)
+        self.robotwin_split_block_size = int(robotwin_split_block_size)
+        self.robotwin_clean_episodes_per_block = int(robotwin_clean_episodes_per_block)
+
         episodes = {}
-        if val_set_proportion < 1e-6:
-            for meta in metas:
-                episodes.update({meta.repo_id: list(range(meta.total_episodes))})
-        else:
-            for meta in metas:
-                split_idx = int(meta.total_episodes * (1 - val_set_proportion))
+        for meta in metas:
+            episode_indices = self._build_episode_indices(meta.total_episodes)
+            total_filtered_episodes = len(episode_indices)
+            if val_set_proportion >= 1e-6:
+                split_idx = int(total_filtered_episodes * (1 - val_set_proportion))
                 # random shuffle episode indices before splitting
-                episode_indices = list(range(meta.total_episodes))
+                episode_indices = list(episode_indices)
                 rng = np.random.default_rng(seed)
                 rng.shuffle(episode_indices)
                 if self.is_training_set:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx)]})
+                    episode_indices = [episode_indices[i] for i in range(split_idx)]
                 else:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx, meta.total_episodes)]})
+                    episode_indices = [
+                        episode_indices[i]
+                        for i in range(split_idx, total_filtered_episodes)
+                    ]
+            episodes.update({meta.repo_id: episode_indices})
+            if self.episode_filter is not None:
+                split_name = "train" if self.is_training_set else "val"
+                logger.info(
+                    f"Using episode_filter={self.episode_filter!r} for {meta.repo_id} "
+                    f"({split_name}): {len(episode_indices)}/{meta.total_episodes} episodes."
+                )
+        self.selected_episodes = episodes
 
         self.multi_dataset = MultiLeRobotDataset(
             dataset_dirs=self.dataset_dirs,
@@ -123,6 +142,48 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             "from": torch.cat([dataset["from"] for dataset in episode_data_index]),
             "to": torch.cat([dataset["to"] for dataset in episode_data_index]),
         }
+
+    @staticmethod
+    def _normalize_episode_filter(episode_filter: Optional[str]) -> Optional[str]:
+        if episode_filter is None:
+            return None
+        episode_filter = str(episode_filter).strip().lower()
+        if episode_filter in {"", "none", "null", "all"}:
+            return None
+        valid_filters = {"robotwin_clean"}
+        if episode_filter not in valid_filters:
+            raise ValueError(
+                f"Unsupported episode_filter={episode_filter!r}. "
+                f"Expected one of {sorted(valid_filters)} or null."
+            )
+        return episode_filter
+
+    def _build_episode_indices(self, total_episodes: int) -> List[int]:
+        if self.episode_filter is None:
+            return list(range(total_episodes))
+        if self.episode_filter == "robotwin_clean":
+            return self._build_robotwin_clean_episode_indices(total_episodes)
+        raise AssertionError(f"Unhandled episode_filter={self.episode_filter!r}")
+
+    def _build_robotwin_clean_episode_indices(self, total_episodes: int) -> List[int]:
+        block_size = self.robotwin_split_block_size
+        clean_per_block = self.robotwin_clean_episodes_per_block
+        if block_size <= 0:
+            raise ValueError(f"`robotwin_split_block_size` must be positive, got {block_size}.")
+        if clean_per_block <= 0 or clean_per_block > block_size:
+            raise ValueError(
+                "`robotwin_clean_episodes_per_block` must be in "
+                f"[1, {block_size}], got {clean_per_block}."
+            )
+        if total_episodes % block_size != 0:
+            raise ValueError(
+                "RobotWin clean episode filter expects complete clean/random blocks: "
+                f"total_episodes={total_episodes}, block_size={block_size}."
+            )
+        clean_episodes: List[int] = []
+        for block_start in range(0, total_episodes, block_size):
+            clean_episodes.extend(range(block_start, block_start + clean_per_block))
+        return clean_episodes
 
     def _get_action(self, meta, lerobot_sample) -> torch.Tensor:
         key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
