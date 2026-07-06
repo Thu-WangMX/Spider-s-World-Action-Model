@@ -82,6 +82,7 @@ class Wan22Trainer:
         if self.val_dataset is not None:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
         self._assert_history_intent_offsets_consistent()
+        self._assert_semantic_history_offsets_consistent()
 
         self._weight_checkpoint_loaded_pre_prepare = False
         self._load_weight_checkpoint_before_prepare()
@@ -96,6 +97,9 @@ class Wan22Trainer:
         intent_encoder = getattr(self.model, "intent_encoder", None)
         if intent_encoder is not None:
             trainable_params.extend(list(intent_encoder.parameters()))
+        semantic_history_encoder = getattr(self.model, "semantic_history_encoder", None)
+        if semantic_history_encoder is not None:
+            trainable_params.extend(list(semantic_history_encoder.trainable_parameters()))
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -314,6 +318,64 @@ class Wan22Trainer:
                 max_history_frames,
             )
 
+    def _assert_semantic_history_offsets_consistent(self):
+        semantic_history_encoder = getattr(self.model, "semantic_history_encoder", None)
+        if semantic_history_encoder is None:
+            return
+
+        semantic_config = getattr(self.model, "semantic_history_config", None) or {}
+        model_offsets = semantic_config.get("history_offsets", None)
+        if model_offsets is None:
+            raise ValueError(
+                "`model.semantic_history_config.history_offsets` must be set when "
+                "`model.semantic_history_config.enabled=true`."
+            )
+        model_offsets = [int(offset) for offset in model_offsets]
+        max_history_frames = int(semantic_config.get("max_history_frames", len(model_offsets)))
+        if max_history_frames < len(model_offsets):
+            raise ValueError(
+                "`model.semantic_history_config.max_history_frames` must be >= len(history_offsets), "
+                f"got {max_history_frames} and {len(model_offsets)}."
+            )
+
+        datasets = [("train_dataset", self.train_dataset)]
+        if self.val_dataset is not None:
+            datasets.append(("val_dataset", self.val_dataset))
+        for dataset_name, dataset in datasets:
+            if not bool(getattr(dataset, "load_semantic_image", False)):
+                raise ValueError(
+                    f"{dataset_name} must set `load_semantic_image=true` when "
+                    "`model.semantic_history_config.enabled=true`."
+                )
+            load_history_latents = bool(getattr(dataset, "load_history_dino_latents", False))
+            load_history_video = bool(getattr(dataset, "load_history_dino_video", False))
+            if int(load_history_latents) + int(load_history_video) != 1:
+                raise ValueError(
+                    f"{dataset_name} should provide exactly one semantic-history DINO source: "
+                    "`load_history_dino_latents=true` for cached latents, or "
+                    "`load_history_dino_video=true` for online DINO encoding."
+                )
+            dataset_offsets = getattr(dataset, "history_dino_frame_offsets", None)
+            if dataset_offsets is None:
+                raise ValueError(
+                    f"{dataset_name} has no `history_dino_frame_offsets`; cannot verify "
+                    "semantic-history train/infer consistency."
+                )
+            dataset_offsets = [int(offset) for offset in dataset_offsets]
+            if dataset_offsets != model_offsets:
+                raise ValueError(
+                    "Semantic-history DINO offset mismatch between model and dataset: "
+                    f"model.semantic_history_config.history_offsets={model_offsets}, "
+                    f"{dataset_name}.history_dino_frame_offsets={dataset_offsets}."
+                )
+
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Qwen semantic-history offsets verified: offsets=%s max_history_frames=%d",
+                model_offsets,
+                max_history_frames,
+            )
+
     def _estimate_total_train_steps(self) -> int:
         if self.max_steps is not None:
             return max(int(self.max_steps), 1)
@@ -429,6 +491,9 @@ class Wan22Trainer:
         if intent_encoder is not None:
             intent_encoder.train()
             intent_encoder.requires_grad_(True)
+        semantic_history_encoder = getattr(model, "semantic_history_encoder", None)
+        if semantic_history_encoder is not None:
+            semantic_history_encoder.set_adapter_train_mode()
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -443,6 +508,7 @@ class Wan22Trainer:
         history_dino_latents = sample.get("history_dino_latents", None)
         history_vae_latents = sample.get("history_vae_latents", None)
         history_video = sample.get("history_video", None)
+        semantic_image = sample.get("semantic_image", sample.get("vlm_image", None))
         action_is_pad = sample.get("action_is_pad", None)
         image_is_pad = sample.get("image_is_pad", None)
 
@@ -644,6 +710,26 @@ class Wan22Trainer:
                     f"history={tuple(history_video.shape)} batch={batch_size}"
                 )
 
+        if semantic_image is not None:
+            if not isinstance(semantic_image, torch.Tensor):
+                raise TypeError(
+                    f"`sample['semantic_image']` must be a torch.Tensor, got {type(semantic_image)}"
+                )
+            if semantic_image.ndim == 3:
+                semantic_image = semantic_image.unsqueeze(0)
+            if semantic_image.ndim != 4 or semantic_image.shape[1] != 3:
+                raise ValueError(
+                    "`sample['semantic_image']` must be [3,H,W] or [B,3,H,W], "
+                    f"got {tuple(semantic_image.shape)}"
+                )
+            if batch_size is None:
+                batch_size = int(semantic_image.shape[0])
+            elif semantic_image.shape[0] != batch_size:
+                raise ValueError(
+                    "Eval semantic image batch mismatch: "
+                    f"semantic={tuple(semantic_image.shape)} batch={batch_size}"
+                )
+
         if action_is_pad is not None:
             if not isinstance(action_is_pad, torch.Tensor):
                 action_is_pad = torch.as_tensor(action_is_pad, dtype=torch.bool)
@@ -672,6 +758,7 @@ class Wan22Trainer:
             "history_dino_latents": history_dino_latents,
             "history_vae_latents": history_vae_latents,
             "history_video": history_video,
+            "semantic_image": semantic_image,
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
             "action_horizon": action_horizon,
@@ -800,6 +887,10 @@ class Wan22Trainer:
                 infer_kwargs["history_vae_latents"] = sample["history_vae_latents"][0]
             elif sample.get("history_video") is not None:
                 infer_kwargs["history_video"] = sample["history_video"]
+            if sample.get("semantic_image") is not None:
+                infer_kwargs["semantic_image"] = sample["semantic_image"][0]
+            if getattr(model, "semantic_history_encoder", None) is not None:
+                infer_kwargs["semantic_prompt"] = prompt
 
             pred = model.infer_action(**infer_kwargs)
             action_metrics = self._compute_eval_action_metrics(sample, pred.get("action"), action)

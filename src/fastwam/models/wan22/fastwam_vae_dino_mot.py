@@ -21,6 +21,7 @@ from .dino_video_dit import DinoVideoDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
+from .semantic_history import QwenDINOHistoryActionAdapter
 
 logger = get_logger(__name__)
 
@@ -43,7 +44,9 @@ class FastWAMVAEDinoMoT(nn.Module):
         vae,
         dino_encoder: DinoVideoEncoder,
         intent_encoder: Optional[DINOHistoryIntentResampler] = None,
+        semantic_history_encoder: Optional[QwenDINOHistoryActionAdapter] = None,
         intent_config: Optional[dict[str, Any]] = None,
+        semantic_history_config: Optional[dict[str, Any]] = None,
         text_encoder=None,
         tokenizer=None,
         text_dim: Optional[int] = None,
@@ -70,7 +73,16 @@ class FastWAMVAEDinoMoT(nn.Module):
         self.vae = vae
         self.dino_encoder = dino_encoder
         self.intent_encoder = intent_encoder
+        self.semantic_history_encoder = semantic_history_encoder
+        if self.intent_encoder is not None and self.semantic_history_encoder is not None:
+            raise ValueError(
+                "FastWAMVAEDinoMoT supports either legacy intent_config or "
+                "semantic_history_config in one model, not both. Use a separate task "
+                "variant for Qwen semantic-history action-only injection."
+            )
+
         self.intent_config = dict(intent_config or {})
+        self.semantic_history_config = dict(semantic_history_config or {})
         self.intent_source = str(self.intent_config.get("source", "dino")).strip().lower()
         if self.intent_source not in {"dino", "vae"}:
             raise ValueError(
@@ -95,6 +107,16 @@ class FastWAMVAEDinoMoT(nn.Module):
             if self.intent_encoder is not None and history_offsets is not None
             else None
         )
+        semantic_offsets = self.semantic_history_config.get("history_offsets", None)
+        self.semantic_history_frame_count = (
+            len(semantic_offsets)
+            if self.semantic_history_encoder is not None and semantic_offsets is not None
+            else None
+        )
+        if self.semantic_history_encoder is not None:
+            self.semantic_history_config["injection_mode"] = str(
+                self.semantic_history_config.get("injection_mode", "action_context_after_proprio")
+            )
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         if text_dim is None:
@@ -166,6 +188,7 @@ class FastWAMVAEDinoMoT(nn.Module):
         loss_lambda_dino: float = 0.02,
         loss_lambda_action: float = 1.0,
         intent_config: Optional[dict[str, Any]] = None,
+        semantic_history_config: Optional[dict[str, Any]] = None,
     ):
         components = load_wan22_ti2v_5b_components(
             device=device,
@@ -281,6 +304,52 @@ class FastWAMVAEDinoMoT(nn.Module):
                 dropout=float(intent_config.get("dropout", 0.0)),
             ).to(device=device, dtype=torch_dtype)
 
+        semantic_history_encoder = None
+        semantic_history_config = dict(semantic_history_config or {})
+        if bool(semantic_history_config.get("enabled", False)):
+            if intent_encoder is not None:
+                raise ValueError(
+                    "`semantic_history_config.enabled=true` cannot be combined with "
+                    "`intent_config.enabled=true` in the same FastWAMVAEDinoMoT model."
+                )
+            injection_mode = str(
+                semantic_history_config.get("injection_mode", "action_context_after_proprio")
+            )
+            if injection_mode != "action_context_after_proprio":
+                raise ValueError(
+                    "Unsupported `semantic_history_config.injection_mode`: "
+                    f"{injection_mode!r}. Expected 'action_context_after_proprio'."
+                )
+            semantic_history_config["injection_mode"] = injection_mode
+            history_offsets = semantic_history_config.get("history_offsets", [-24, -16, -8, -1])
+            history_offsets = [int(offset) for offset in history_offsets]
+            if not history_offsets:
+                raise ValueError("`semantic_history_config.history_offsets` must contain at least one offset.")
+            semantic_history_config["history_offsets"] = history_offsets
+            max_history_frames = int(
+                semantic_history_config.get("max_history_frames", max(1, len(history_offsets)))
+            )
+            semantic_history_config["max_history_frames"] = max_history_frames
+            semantic_history_encoder = QwenDINOHistoryActionAdapter(
+                vlm_model_name_or_path=str(semantic_history_config["vlm_model_name_or_path"]),
+                vlm_family=str(semantic_history_config.get("vlm_family", "qwen3_vl")),
+                trust_remote_code=bool(semantic_history_config.get("trust_remote_code", True)),
+                freeze_vlm=bool(semantic_history_config.get("freeze_vlm", True)),
+                processor_min_pixels=semantic_history_config.get("processor_min_pixels", None),
+                processor_max_pixels=semantic_history_config.get("processor_max_pixels", None),
+                attn_implementation=semantic_history_config.get("attn_implementation", None),
+                dino_dim=int(dino_config.get("feature_dim", 1024)),
+                text_dim=text_dim,
+                history_offsets=history_offsets,
+                max_history_frames=max_history_frames,
+                num_output_tokens=int(semantic_history_config.get("num_output_tokens", 8)),
+                resampler_dim=int(semantic_history_config.get("resampler_dim", 1024)),
+                num_layers=int(semantic_history_config.get("num_resampler_layers", 2)),
+                num_heads=int(semantic_history_config.get("num_heads", 8)),
+                dropout=float(semantic_history_config.get("dropout", 0.0)),
+                torch_dtype=torch_dtype,
+            ).to(device=device, dtype=torch_dtype)
+
         action_expert = ActionDiT.from_pretrained(
             action_dit_config=action_dit_config,
             action_dit_pretrained_path=action_dit_pretrained_path,
@@ -314,7 +383,9 @@ class FastWAMVAEDinoMoT(nn.Module):
             vae=components.vae,
             dino_encoder=dino_encoder,
             intent_encoder=intent_encoder,
+            semantic_history_encoder=semantic_history_encoder,
             intent_config=intent_config,
+            semantic_history_config=semantic_history_config,
             text_encoder=components.text_encoder,
             tokenizer=components.tokenizer,
             text_dim=text_dim,
@@ -352,6 +423,8 @@ class FastWAMVAEDinoMoT(nn.Module):
         self.vae.to(*args, **kwargs)
         if self.dino_encoder is not None and self.dino_encoder._loaded:
             self.dino_encoder.backbone.to(*args, **kwargs)
+        if self.semantic_history_encoder is not None:
+            self.semantic_history_encoder.to(*args, **kwargs)
         return self
 
     @torch.no_grad()
@@ -451,6 +524,100 @@ class FastWAMVAEDinoMoT(nn.Module):
             non_blocking=True,
         )
         return self.intent_encoder(history_latents)
+
+    def _encode_semantic_history_tokens(
+        self,
+        *,
+        prompts,
+        semantic_image: torch.Tensor,
+        history_dino_latents: Optional[torch.Tensor] = None,
+        history_video: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.semantic_history_encoder is None:
+            raise ValueError("`semantic_history_encoder` is not enabled for this model.")
+        if prompts is None:
+            raise ValueError(
+                "`prompt`/`semantic_prompt` is required when semantic_history_config.enabled=true. "
+                "Cached T5 context alone is not enough for Qwen-VL semantic encoding."
+            )
+        if not torch.is_tensor(semantic_image):
+            raise TypeError(f"`semantic_image` must be a tensor, got {type(semantic_image)}")
+        if semantic_image.ndim == 3:
+            semantic_image = semantic_image.unsqueeze(0)
+        if semantic_image.ndim != 4 or semantic_image.shape[1] != 3:
+            raise ValueError(
+                f"`semantic_image` must be [B,3,H,W] or [3,H,W], got {tuple(semantic_image.shape)}"
+            )
+        batch_size = int(semantic_image.shape[0])
+        if history_dino_latents is not None and history_video is not None:
+            raise ValueError("Provide only one of `history_dino_latents` or `history_video`.")
+        if history_dino_latents is None:
+            if history_video is None:
+                raise ValueError(
+                    "`history_dino_latents` or `history_video` is required when "
+                    "semantic_history_config.enabled=true."
+                )
+            if history_video.ndim == 4:
+                if history_video.shape[0] == 3:
+                    history_video = history_video.unsqueeze(0).contiguous()
+                elif history_video.shape[1] == 3:
+                    history_video = history_video.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
+                else:
+                    raise ValueError(
+                        f"`history_video` must be [3,T,H,W] or [T,3,H,W], got {tuple(history_video.shape)}"
+                    )
+            elif history_video.ndim == 5:
+                if history_video.shape[1] == 3:
+                    pass
+                elif history_video.shape[2] == 3:
+                    history_video = history_video.permute(0, 2, 1, 3, 4).contiguous()
+                else:
+                    raise ValueError(
+                        f"`history_video` must be [B,3,T,H,W] or [B,T,3,H,W], got {tuple(history_video.shape)}"
+                    )
+            else:
+                raise ValueError(f"`history_video` must be 4D or 5D, got {tuple(history_video.shape)}")
+            if history_video.shape[0] != batch_size:
+                raise ValueError(
+                    f"Batch mismatch between semantic_image and history_video: "
+                    f"{batch_size} vs {history_video.shape[0]}"
+                )
+            if not bool(getattr(self.dino_encoder, "_loaded", False)):
+                raise ValueError(
+                    "Online semantic-history DINO encoding requires `model.dino_config.load_backbone=true`."
+                )
+            history_dino_latents = self._encode_video_dino(
+                history_video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            )
+        elif history_dino_latents.ndim == 4:
+            history_dino_latents = history_dino_latents.unsqueeze(0)
+        if history_dino_latents.ndim != 5:
+            raise ValueError(
+                f"`history_dino_latents` must be 5D [B,D,T,H,W], got {tuple(history_dino_latents.shape)}"
+            )
+        if history_dino_latents.shape[0] != batch_size:
+            raise ValueError(
+                f"Batch mismatch between semantic_image and history_dino_latents: "
+                f"{batch_size} vs {history_dino_latents.shape[0]}"
+            )
+        if (
+            self.semantic_history_frame_count is not None
+            and history_dino_latents.shape[2] != self.semantic_history_frame_count
+        ):
+            raise ValueError(
+                "Semantic history temporal length does not match semantic_history_config.history_offsets: "
+                f"got T={history_dino_latents.shape[2]}, expected {self.semantic_history_frame_count}."
+            )
+        self._validate_dino_latent_shape(history_dino_latents)
+        return self.semantic_history_encoder(
+            prompts=prompts,
+            semantic_image=semantic_image,
+            history_dino_latents=history_dino_latents.to(
+                device=self.device,
+                dtype=self.torch_dtype,
+                non_blocking=True,
+            ),
+        )
 
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
@@ -602,16 +769,18 @@ class FastWAMVAEDinoMoT(nn.Module):
         history_dino_latents = sample.get("history_dino_latents", None)
         history_vae_latents = sample.get("history_vae_latents", None)
         history_video = sample.get("history_video", None)
+        semantic_image = sample.get("semantic_image", sample.get("vlm_image", None))
+        semantic_prompt = sample.get("semantic_prompt", sample.get("prompt", None))
 
-        if self.intent_encoder is None and (
+        if self.intent_encoder is None and self.semantic_history_encoder is None and (
             history_dino_latents is not None
             or history_vae_latents is not None
             or history_video is not None
         ):
             raise ValueError(
-                "FastWAMVAEDinoMoT does not consume short-intent history tokens. "
+                "FastWAMVAEDinoMoT does not consume short history tokens. "
                 "Disable history inputs for this config, or enable "
-                "`model.intent_config.enabled=true`."
+                "`model.intent_config.enabled=true` or `model.semantic_history_config.enabled=true`."
             )
 
         if action.ndim != 3:
@@ -732,6 +901,13 @@ class FastWAMVAEDinoMoT(nn.Module):
                 proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
             )
 
+        context_video = context
+        context_video_mask = context_mask
+        context_dino = context
+        context_dino_mask = context_mask
+        context_action = context
+        context_action_mask = context_mask
+
         if self.intent_encoder is not None:
             if self.intent_source == "vae":
                 if history_dino_latents is not None:
@@ -825,6 +1001,34 @@ class FastWAMVAEDinoMoT(nn.Module):
                 context_mask=context_mask,
                 intent_tokens=intent_tokens,
             )
+            context_video = context
+            context_video_mask = context_mask
+            context_dino = context
+            context_dino_mask = context_mask
+            context_action = context
+            context_action_mask = context_mask
+
+        if self.semantic_history_encoder is not None:
+            if history_vae_latents is not None:
+                raise ValueError(
+                    "`history_vae_latents` was provided, but semantic_history_config consumes DINO history."
+                )
+            if semantic_image is None:
+                raise ValueError(
+                    "`semantic_image` is required when `model.semantic_history_config.enabled=true`. "
+                    "Set `data.train.load_semantic_image=true`."
+                )
+            semantic_tokens = self._encode_semantic_history_tokens(
+                prompts=semantic_prompt,
+                semantic_image=semantic_image,
+                history_dino_latents=history_dino_latents,
+                history_video=history_video,
+            )
+            context_action, context_action_mask = self._append_intent_to_context(
+                context=context,
+                context_mask=context_mask,
+                intent_tokens=semantic_tokens,
+            )
 
         action = action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         if action_is_pad is not None:
@@ -842,8 +1046,14 @@ class FastWAMVAEDinoMoT(nn.Module):
                 )
 
         return {
-            "context": context,
-            "context_mask": context_mask,
+            "context": context_action,
+            "context_mask": context_action_mask,
+            "context_video": context_video,
+            "context_video_mask": context_video_mask,
+            "context_dino": context_dino,
+            "context_dino_mask": context_dino_mask,
+            "context_action": context_action,
+            "context_action_mask": context_action_mask,
             "input_vae_latents": input_vae_latents,
             "input_dino_latents": input_dino_latents,
             "first_frame_vae_latents": input_vae_latents[:, :, 0:1],
@@ -956,6 +1166,12 @@ class FastWAMVAEDinoMoT(nn.Module):
         inputs = self.build_inputs(sample, tiled=tiled)
         context = inputs["context"]
         context_mask = inputs["context_mask"]
+        context_video = inputs.get("context_video", context)
+        context_video_mask = inputs.get("context_video_mask", context_mask)
+        context_dino = inputs.get("context_dino", context)
+        context_dino_mask = inputs.get("context_dino_mask", context_mask)
+        context_action = inputs.get("context_action", context)
+        context_action_mask = inputs.get("context_action_mask", context_mask)
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
@@ -991,23 +1207,23 @@ class FastWAMVAEDinoMoT(nn.Module):
         vae_pre = self.video_expert.pre_dit(
             x=noisy_vae,
             timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
+            context=context_video,
+            context_mask=context_video_mask,
             action=action,
             fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
         )
         dino_pre = self.dino_video_expert.pre_dit(
             x=noisy_dino,
             timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
+            context=context_dino,
+            context_mask=context_dino_mask,
             fuse_vae_embedding_in_latents=True,
         )
         action_pre = self.action_expert.pre_dit(
             action_tokens=noisy_action,
             timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
+            context=context_action,
+            context_mask=context_action_mask,
         )
 
         attention_mask = self._build_tribranch_attention_mask(
@@ -1108,28 +1324,46 @@ class FastWAMVAEDinoMoT(nn.Module):
         context: torch.Tensor,
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
+        context_video: Optional[torch.Tensor] = None,
+        context_video_mask: Optional[torch.Tensor] = None,
+        context_dino: Optional[torch.Tensor] = None,
+        context_dino_mask: Optional[torch.Tensor] = None,
+        context_action: Optional[torch.Tensor] = None,
+        context_action_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if context_video is None:
+            context_video = context
+        if context_video_mask is None:
+            context_video_mask = context_mask
+        if context_dino is None:
+            context_dino = context
+        if context_dino_mask is None:
+            context_dino_mask = context_mask
+        if context_action is None:
+            context_action = context
+        if context_action_mask is None:
+            context_action_mask = context_mask
         timestep_video = torch.zeros_like(timestep_action, dtype=first_frame_vae_latents.dtype, device=self.device)
         vae_pre = self.video_expert.pre_dit(
             x=first_frame_vae_latents,
             timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
+            context=context_video,
+            context_mask=context_video_mask,
             action=None,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
         )
         dino_pre = self.dino_video_expert.pre_dit(
             x=first_frame_dino_latents,
             timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
+            context=context_dino,
+            context_mask=context_dino_mask,
             fuse_vae_embedding_in_latents=True,
         )
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
+            context=context_action,
+            context_mask=context_action_mask,
         )
         attention_mask = self._build_tribranch_attention_mask(
             vae_seq_len=vae_pre["tokens"].shape[1],
@@ -1183,16 +1417,19 @@ class FastWAMVAEDinoMoT(nn.Module):
         history_dino_latents: Optional[torch.Tensor] = None,
         history_vae_latents: Optional[torch.Tensor] = None,
         history_video: Optional[torch.Tensor] = None,
+        semantic_image: Optional[torch.Tensor] = None,
+        semantic_prompt: Optional[str] = None,
     ) -> dict[str, Any]:
         self.eval()
-        if self.intent_encoder is None and (
+        if self.intent_encoder is None and self.semantic_history_encoder is None and (
             history_dino_latents is not None
             or history_vae_latents is not None
             or history_video is not None
         ):
             raise ValueError(
-                "FastWAMVAEDinoMoT does not consume short-intent history tokens. "
-                "Disable history inputs for this config, or enable `model.intent_config.enabled=true`."
+                "FastWAMVAEDinoMoT does not consume short history tokens. "
+                "Disable history inputs for this config, or enable "
+                "`model.intent_config.enabled=true` or `model.semantic_history_config.enabled=true`."
             )
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError("`infer_action` requires VAE video_attention_mask_mode='first_frame_causal'.")
@@ -1236,6 +1473,13 @@ class FastWAMVAEDinoMoT(nn.Module):
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
         if proprio is not None:
             context, context_mask = self._append_proprio_to_context(context, context_mask, proprio)
+
+        context_video = context
+        context_video_mask = context_mask
+        context_dino = context
+        context_dino_mask = context_mask
+        context_action = context
+        context_action_mask = context_mask
 
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         latents_action = torch.randn(
@@ -1352,6 +1596,33 @@ class FastWAMVAEDinoMoT(nn.Module):
                 context_mask=context_mask,
                 intent_tokens=intent_tokens,
             )
+            context_video = context
+            context_video_mask = context_mask
+            context_dino = context
+            context_dino_mask = context_mask
+            context_action = context
+            context_action_mask = context_mask
+
+        if self.semantic_history_encoder is not None:
+            if history_vae_latents is not None:
+                raise ValueError(
+                    "`history_vae_latents` was provided, but semantic_history_config consumes DINO history."
+                )
+            if semantic_image is None:
+                semantic_image = input_image
+            if semantic_prompt is None:
+                semantic_prompt = prompt
+            semantic_tokens = self._encode_semantic_history_tokens(
+                prompts=semantic_prompt,
+                semantic_image=semantic_image,
+                history_dino_latents=history_dino_latents,
+                history_video=history_video,
+            )
+            context_action, context_action_mask = self._append_intent_to_context(
+                context=context,
+                context_mask=context_mask,
+                intent_tokens=semantic_tokens,
+            )
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -1366,9 +1637,15 @@ class FastWAMVAEDinoMoT(nn.Module):
                 first_frame_dino_latents=first_frame_dino_latents,
                 latents_action=latents_action,
                 timestep_action=timestep_action,
-                context=context,
-                context_mask=context_mask,
+                context=context_action,
+                context_mask=context_action_mask,
                 fuse_vae_embedding_in_latents=fuse_flag,
+                context_video=context_video,
+                context_video_mask=context_video_mask,
+                context_dino=context_dino,
+                context_dino_mask=context_dino_mask,
+                context_action=context_action,
+                context_action_mask=context_action_mask,
             )
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
@@ -1390,6 +1667,9 @@ class FastWAMVAEDinoMoT(nn.Module):
         if self.intent_encoder is not None:
             payload["intent_encoder"] = self.intent_encoder.state_dict()
             payload["intent_config"] = self.intent_config
+        if self.semantic_history_encoder is not None:
+            payload["semantic_history_encoder"] = self.semantic_history_encoder.adapter_state_dict()
+            payload["semantic_history_config"] = self.semantic_history_config
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -1421,11 +1701,39 @@ class FastWAMVAEDinoMoT(nn.Module):
                         f"checkpoint={checkpoint_config[key]!r}, current={self.intent_config[key]!r}."
                     )
 
+    def _validate_checkpoint_semantic_history_config(self, checkpoint: dict[str, Any]) -> None:
+        checkpoint_has_semantic = "semantic_history_encoder" in checkpoint
+        current_has_semantic = self.semantic_history_encoder is not None
+        if checkpoint_has_semantic and not current_has_semantic:
+            raise ValueError(
+                "Checkpoint contains `semantic_history_encoder` weights, but current "
+                "FastWAMVAEDinoMoT was built without semantic_history_config. Rebuild the "
+                "model with the checkpoint's semantic_history_config before evaluation/loading."
+            )
+        if not checkpoint_has_semantic:
+            return
+        checkpoint_config = dict(checkpoint.get("semantic_history_config") or {})
+        checkpoint_mode = str(checkpoint_config.get("injection_mode", "action_context_after_proprio"))
+        current_mode = str(self.semantic_history_config.get("injection_mode", "action_context_after_proprio"))
+        if checkpoint_mode != current_mode:
+            raise ValueError(
+                "Checkpoint semantic_history_config.injection_mode mismatch: "
+                f"checkpoint={checkpoint_mode!r}, current={current_mode!r}."
+            )
+        for key in ("history_offsets", "max_history_frames", "num_output_tokens", "vlm_model_name_or_path"):
+            if key in checkpoint_config and key in self.semantic_history_config:
+                if checkpoint_config[key] != self.semantic_history_config[key]:
+                    raise ValueError(
+                        f"Checkpoint semantic_history_config.{key} mismatch: "
+                        f"checkpoint={checkpoint_config[key]!r}, current={self.semantic_history_config[key]!r}."
+                    )
+
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
         if "mot" not in payload:
             raise ValueError(f"Checkpoint missing `mot` keys for FastWAMVAEDinoMoT: {path}")
         self._validate_checkpoint_intent_config(payload)
+        self._validate_checkpoint_semantic_history_config(payload)
         missing, unexpected = self.mot.load_state_dict(payload["mot"], strict=False)
         if missing or unexpected:
             logger.warning(
@@ -1445,6 +1753,17 @@ class FastWAMVAEDinoMoT(nn.Module):
                 logger.info(
                     "FastWAMVAEDinoMoT intent_encoder is enabled, but checkpoint has no "
                     "intent_encoder weights; keeping randomly initialized intent encoder."
+                )
+        if self.semantic_history_encoder is not None:
+            if "semantic_history_encoder" in payload:
+                self.semantic_history_encoder.load_adapter_state_dict(
+                    payload["semantic_history_encoder"],
+                    strict=True,
+                )
+            else:
+                logger.info(
+                    "FastWAMVAEDinoMoT semantic_history_encoder is enabled, but checkpoint has no "
+                    "semantic_history_encoder weights; keeping randomly initialized adapter."
                 )
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])

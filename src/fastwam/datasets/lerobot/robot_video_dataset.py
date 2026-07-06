@@ -61,6 +61,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         load_history_dino_video: bool = False,
         load_history_vae_video: bool = False,
         history_vae_frame_offsets: Optional[list[int]] = None,
+        load_semantic_image: bool = False,
+        semantic_frame_offset: int = 0,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -138,6 +140,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 "`load_history_dino_video=true`."
             )
         self.load_history_vae_video = bool(load_history_vae_video)
+        self.load_semantic_image = bool(load_semantic_image)
+        self.semantic_frame_offset = int(semantic_frame_offset)
         if history_vae_frame_offsets is None:
             history_vae_frame_offsets = self.history_dino_frame_offsets
         self.history_vae_frame_offsets = [int(offset) for offset in history_vae_frame_offsets]
@@ -830,6 +834,24 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         }
         if video is not None:
             data["video"] = video
+        if self.load_semantic_image:
+            if video is not None:
+                data["semantic_image"] = video[:, 0].contiguous()
+            else:
+                semantic_idx = self._get_global_indices_for_offsets(
+                    resolved_sample_idx,
+                    [self.semantic_frame_offset],
+                )
+                semantic_video = self._load_history_video_frames(
+                    resolved_sample_idx,
+                    semantic_idx,
+                    "Semantic current image",
+                )
+                if semantic_video.shape[1] != 1:
+                    raise ValueError(
+                        f"Expected one semantic image frame, got T={semantic_video.shape[1]}"
+                    )
+                data["semantic_image"] = semantic_video[:, 0].contiguous()
         if self.load_text_context:
             data["context"] = context
             data["context_mask"] = context_mask

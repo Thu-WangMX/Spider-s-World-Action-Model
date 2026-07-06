@@ -350,15 +350,22 @@ def _get_future_frame_capture_steps(cfg: DictConfig) -> list[int]:
 
 
 def _model_uses_history_intent(model: torch.nn.Module) -> bool:
-    return getattr(model, "intent_encoder", None) is not None
+    return (
+        getattr(model, "intent_encoder", None) is not None
+        or getattr(model, "semantic_history_encoder", None) is not None
+    )
 
 
 def _get_history_frame_offsets(model: torch.nn.Module) -> list[int]:
-    intent_config = getattr(model, "intent_config", None) or {}
-    offsets = intent_config.get(
-        "history_offsets",
-        intent_config.get("history_dino_frame_offsets", [-8, -4, 0]),
-    )
+    if getattr(model, "semantic_history_encoder", None) is not None:
+        semantic_config = getattr(model, "semantic_history_config", None) or {}
+        offsets = semantic_config.get("history_offsets", [-24, -16, -8, -1])
+    else:
+        intent_config = getattr(model, "intent_config", None) or {}
+        offsets = intent_config.get(
+            "history_offsets",
+            intent_config.get("history_dino_frame_offsets", [-8, -4, 0]),
+        )
     return [int(offset) for offset in offsets]
 
 

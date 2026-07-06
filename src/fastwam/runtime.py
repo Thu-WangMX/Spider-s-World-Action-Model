@@ -365,6 +365,7 @@ def create_fastwam_vae_dino_mot(
     action_scheduler=None,
     loss=None,
     intent_config=None,
+    semantic_history_config=None,
     mot_checkpoint_mixed_attn: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
@@ -432,6 +433,15 @@ def create_fastwam_vae_dino_mot(
     if not isinstance(intent_config, dict):
         raise ValueError(f"`intent_config` must resolve to a dict, got {type(intent_config)}")
 
+    if isinstance(semantic_history_config, DictConfig):
+        semantic_history_config = OmegaConf.to_container(semantic_history_config, resolve=True)
+    if semantic_history_config is None:
+        semantic_history_config = {}
+    if not isinstance(semantic_history_config, dict):
+        raise ValueError(
+            f"`semantic_history_config` must resolve to a dict, got {type(semantic_history_config)}"
+        )
+
     return FastWAMVAEDinoMoT.from_config(
         dino_config=dino_config,
         vae_video_dit_config=vae_video_dit_config,
@@ -460,6 +470,7 @@ def create_fastwam_vae_dino_mot(
         loss_lambda_dino=float(loss.get("lambda_dino", 0.02)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         intent_config=intent_config,
+        semantic_history_config=semantic_history_config,
     )
 
 def create_fastwam_idm(
