@@ -183,12 +183,16 @@ class WorldActionRobotWinPolicy:
 
         self.pending_actions: deque[np.ndarray] = deque()
         intent_cfg = getattr(self.model, "intent_config", {}) or {}
+        semantic_cfg = getattr(self.model, "semantic_history_config", {}) or {}
         self._uses_intent_history = bool(getattr(self.model, "intent_encoder", None) is not None)
+        self._uses_semantic_history = bool(getattr(self.model, "semantic_history_encoder", None) is not None)
+        self._uses_history = self._uses_intent_history or self._uses_semantic_history
+        history_cfg = semantic_cfg if self._uses_semantic_history else intent_cfg
         self._history_offsets = [
             int(offset)
-            for offset in intent_cfg.get(
+            for offset in history_cfg.get(
                 "history_offsets",
-                intent_cfg.get("history_dino_frame_offsets", [-8, -4, 0]),
+                history_cfg.get("history_dino_frame_offsets", [-8, -4, 0]),
             )
         ]
         self._history_images: deque[torch.Tensor] = deque(
@@ -199,11 +203,16 @@ class WorldActionRobotWinPolicy:
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
         logger.info(
-            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
+            (
+                "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | "
+                "horizon=%d | replan=%d | intent_history=%s | semantic_history=%s"
+            ),
             checkpoint_path,
             dataset_stats_path,
             self.action_horizon,
             self.replan_steps,
+            self._uses_intent_history,
+            self._uses_semantic_history,
         )
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
@@ -248,11 +257,11 @@ class WorldActionRobotWinPolicy:
         return image_tensor
 
     def _append_history_image(self, image_tensor: torch.Tensor) -> None:
-        if self._uses_intent_history:
+        if self._uses_history:
             self._history_images.append(image_tensor.detach())
 
     def _build_history_video_tensor(self) -> Optional[torch.Tensor]:
-        if not self._uses_intent_history or not self._history_images:
+        if not self._uses_history or not self._history_images:
             return None
 
         frames = list(self._history_images)
@@ -289,11 +298,17 @@ class WorldActionRobotWinPolicy:
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
-        if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
+        infer_params = inspect.signature(self.model.infer_action).parameters
+        if "num_video_frames" in infer_params:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
         history_video = self._build_history_video_tensor()
-        if history_video is not None and "history_video" in inspect.signature(self.model.infer_action).parameters:
+        if history_video is not None and "history_video" in infer_params:
             infer_kwargs["history_video"] = history_video
+        if self._uses_semantic_history:
+            if "semantic_image" in infer_params:
+                infer_kwargs["semantic_image"] = image_tensor
+            if "semantic_prompt" in infer_params:
+                infer_kwargs["semantic_prompt"] = prompt
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
@@ -320,7 +335,7 @@ class WorldActionRobotWinPolicy:
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
 
     def should_request_observation(self) -> bool:
-        if self._uses_intent_history:
+        if self._uses_history:
             return True
         return not self.pending_actions
 
