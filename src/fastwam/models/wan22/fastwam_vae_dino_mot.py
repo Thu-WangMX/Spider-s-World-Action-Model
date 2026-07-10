@@ -26,6 +26,7 @@ from .semantic_history import QwenDINOHistoryActionAdapter
 logger = get_logger(__name__)
 
 INTENT_INJECTION_MODES = {"context_after_proprio"}
+DINO_FUTURE_MODES = {"predict", "condition_only"}
 
 
 class FastWAMVAEDinoMoT(nn.Module):
@@ -62,6 +63,7 @@ class FastWAMVAEDinoMoT(nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_dino: float = 0.02,
         loss_lambda_action: float = 1.0,
+        dino_future_mode: str = "predict",
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -83,6 +85,12 @@ class FastWAMVAEDinoMoT(nn.Module):
 
         self.intent_config = dict(intent_config or {})
         self.semantic_history_config = dict(semantic_history_config or {})
+        self.dino_future_mode = str(dino_future_mode).strip().lower()
+        if self.dino_future_mode not in DINO_FUTURE_MODES:
+            raise ValueError(
+                f"Unsupported `dino_future_mode={self.dino_future_mode!r}`; "
+                f"expected one of {sorted(DINO_FUTURE_MODES)}."
+            )
         self.intent_source = str(self.intent_config.get("source", "dino")).strip().lower()
         if self.intent_source not in {"dino", "vae"}:
             raise ValueError(
@@ -107,16 +115,24 @@ class FastWAMVAEDinoMoT(nn.Module):
             if self.intent_encoder is not None and history_offsets is not None
             else None
         )
+        self.semantic_history_uses_history = bool(
+            self.semantic_history_config.get("use_history", True)
+        )
         semantic_offsets = self.semantic_history_config.get("history_offsets", None)
         self.semantic_history_frame_count = (
             len(semantic_offsets)
-            if self.semantic_history_encoder is not None and semantic_offsets is not None
+            if (
+                self.semantic_history_encoder is not None
+                and self.semantic_history_uses_history
+                and semantic_offsets is not None
+            )
             else None
         )
         if self.semantic_history_encoder is not None:
             self.semantic_history_config["injection_mode"] = str(
                 self.semantic_history_config.get("injection_mode", "action_context_after_proprio")
             )
+            self.semantic_history_config["use_history"] = self.semantic_history_uses_history
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         if text_dim is None:
@@ -189,6 +205,7 @@ class FastWAMVAEDinoMoT(nn.Module):
         loss_lambda_action: float = 1.0,
         intent_config: Optional[dict[str, Any]] = None,
         semantic_history_config: Optional[dict[str, Any]] = None,
+        dino_future_mode: str = "predict",
     ):
         components = load_wan22_ti2v_5b_components(
             device=device,
@@ -321,9 +338,13 @@ class FastWAMVAEDinoMoT(nn.Module):
                     f"{injection_mode!r}. Expected 'action_context_after_proprio'."
                 )
             semantic_history_config["injection_mode"] = injection_mode
-            history_offsets = semantic_history_config.get("history_offsets", [-24, -16, -8, -1])
+            use_history = bool(semantic_history_config.get("use_history", True))
+            semantic_history_config["use_history"] = use_history
+            history_offsets = semantic_history_config.get(
+                "history_offsets", [-24, -16, -8, -1] if use_history else []
+            )
             history_offsets = [int(offset) for offset in history_offsets]
-            if not history_offsets:
+            if use_history and not history_offsets:
                 raise ValueError("`semantic_history_config.history_offsets` must contain at least one offset.")
             semantic_history_config["history_offsets"] = history_offsets
             max_history_frames = int(
@@ -342,6 +363,7 @@ class FastWAMVAEDinoMoT(nn.Module):
                 text_dim=text_dim,
                 history_offsets=history_offsets,
                 max_history_frames=max_history_frames,
+                use_history=use_history,
                 num_output_tokens=int(semantic_history_config.get("num_output_tokens", 8)),
                 resampler_dim=int(semantic_history_config.get("resampler_dim", 1024)),
                 num_layers=int(semantic_history_config.get("num_resampler_layers", 2)),
@@ -401,6 +423,7 @@ class FastWAMVAEDinoMoT(nn.Module):
             loss_lambda_video=loss_lambda_video,
             loss_lambda_dino=loss_lambda_dino,
             loss_lambda_action=loss_lambda_action,
+            dino_future_mode=dino_future_mode,
         )
         model.model_paths = {
             "vae_video_dit": components.dit_path,
@@ -549,6 +572,16 @@ class FastWAMVAEDinoMoT(nn.Module):
                 f"`semantic_image` must be [B,3,H,W] or [3,H,W], got {tuple(semantic_image.shape)}"
             )
         batch_size = int(semantic_image.shape[0])
+        if not self.semantic_history_uses_history:
+            if history_dino_latents is not None or history_video is not None:
+                raise ValueError(
+                    "This semantic adapter has use_history=false, so history inputs must be omitted."
+                )
+            return self.semantic_history_encoder(
+                prompts=prompts,
+                semantic_image=semantic_image,
+                history_dino_latents=None,
+            )
         if history_dino_latents is not None and history_video is not None:
             raise ValueError("Provide only one of `history_dino_latents` or `history_video`.")
         if history_dino_latents is None:
@@ -1190,10 +1223,17 @@ class FastWAMVAEDinoMoT(nn.Module):
         target_vae = self.train_video_scheduler.training_target(clean_vae, noise_vae, timestep_video)
         noisy_vae[:, :, 0:1] = inputs["first_frame_vae_latents"]
 
-        noise_dino = torch.randn_like(clean_dino)
-        noisy_dino = self.train_video_scheduler.add_noise(clean_dino, noise_dino, timestep_video)
-        target_dino = self.train_video_scheduler.training_target(clean_dino, noise_dino, timestep_video)
-        noisy_dino[:, :, 0:1] = inputs["first_frame_dino_latents"]
+        if self.dino_future_mode == "condition_only":
+            # Match action inference: the DINO expert receives only f0 at t=0.
+            noisy_dino = inputs["first_frame_dino_latents"]
+            timestep_dino = torch.zeros_like(timestep_video)
+            target_dino = None
+        else:
+            noise_dino = torch.randn_like(clean_dino)
+            noisy_dino = self.train_video_scheduler.add_noise(clean_dino, noise_dino, timestep_video)
+            target_dino = self.train_video_scheduler.training_target(clean_dino, noise_dino, timestep_video)
+            noisy_dino[:, :, 0:1] = inputs["first_frame_dino_latents"]
+            timestep_dino = timestep_video
 
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
@@ -1214,7 +1254,7 @@ class FastWAMVAEDinoMoT(nn.Module):
         )
         dino_pre = self.dino_video_expert.pre_dit(
             x=noisy_dino,
-            timestep=timestep_video,
+            timestep=timestep_dino,
             context=context_dino,
             context_mask=context_dino_mask,
             fuse_vae_embedding_in_latents=True,
@@ -1277,19 +1317,22 @@ class FastWAMVAEDinoMoT(nn.Module):
         )
         loss_video = (loss_vae_per_sample * video_weight).mean()
 
-        pred_dino = pred_dino[:, :, 1:]
-        target_dino = self.dino_video_expert.target_to_output_space(target_dino)[:, :, 1:]
-        loss_dino_per_sample = self._compute_dino_video_loss_per_sample(
-            pred_video=pred_dino,
-            target_video=target_dino,
-            image_is_pad=image_is_pad,
-            include_initial_frame=False,
-        )
-        dino_weight = self.train_video_scheduler.training_weight(timestep_video).to(
-            loss_dino_per_sample.device,
-            dtype=loss_dino_per_sample.dtype,
-        )
-        loss_dino = (loss_dino_per_sample * dino_weight).mean()
+        if self.dino_future_mode == "condition_only":
+            loss_dino = torch.zeros((), device=loss_video.device, dtype=loss_video.dtype)
+        else:
+            pred_dino = pred_dino[:, :, 1:]
+            target_dino = self.dino_video_expert.target_to_output_space(target_dino)[:, :, 1:]
+            loss_dino_per_sample = self._compute_dino_video_loss_per_sample(
+                pred_video=pred_dino,
+                target_video=target_dino,
+                image_is_pad=image_is_pad,
+                include_initial_frame=False,
+            )
+            dino_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+                loss_dino_per_sample.device,
+                dtype=loss_dino_per_sample.dtype,
+            )
+            loss_dino = (loss_dino_per_sample * dino_weight).mean()
 
         action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
         if action_is_pad is not None:
@@ -1661,6 +1704,7 @@ class FastWAMVAEDinoMoT(nn.Module):
                 "lambda_dino": self.loss_lambda_dino,
                 "lambda_action": self.loss_lambda_action,
             },
+            "dino_future_mode": self.dino_future_mode,
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
@@ -1720,7 +1764,13 @@ class FastWAMVAEDinoMoT(nn.Module):
                 "Checkpoint semantic_history_config.injection_mode mismatch: "
                 f"checkpoint={checkpoint_mode!r}, current={current_mode!r}."
             )
-        for key in ("history_offsets", "max_history_frames", "num_output_tokens", "vlm_model_name_or_path"):
+        for key in (
+            "use_history",
+            "history_offsets",
+            "max_history_frames",
+            "num_output_tokens",
+            "vlm_model_name_or_path",
+        ):
             if key in checkpoint_config and key in self.semantic_history_config:
                 if checkpoint_config[key] != self.semantic_history_config[key]:
                     raise ValueError(
@@ -1732,6 +1782,12 @@ class FastWAMVAEDinoMoT(nn.Module):
         payload = torch.load(path, map_location="cpu")
         if "mot" not in payload:
             raise ValueError(f"Checkpoint missing `mot` keys for FastWAMVAEDinoMoT: {path}")
+        checkpoint_dino_future_mode = str(payload.get("dino_future_mode", "predict")).strip().lower()
+        if checkpoint_dino_future_mode != self.dino_future_mode:
+            raise ValueError(
+                "Checkpoint dino_future_mode mismatch: "
+                f"checkpoint={checkpoint_dino_future_mode!r}, current={self.dino_future_mode!r}."
+            )
         self._validate_checkpoint_intent_config(payload)
         self._validate_checkpoint_semantic_history_config(payload)
         missing, unexpected = self.mot.load_state_dict(payload["mot"], strict=False)

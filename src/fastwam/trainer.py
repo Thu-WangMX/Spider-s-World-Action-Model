@@ -324,6 +324,22 @@ class Wan22Trainer:
             return
 
         semantic_config = getattr(self.model, "semantic_history_config", None) or {}
+        use_history = bool(semantic_config.get("use_history", True))
+        datasets = [("train_dataset", self.train_dataset)]
+        if self.val_dataset is not None:
+            datasets.append(("val_dataset", self.val_dataset))
+        for dataset_name, dataset in datasets:
+            if not bool(getattr(dataset, "load_semantic_image", False)):
+                raise ValueError(
+                    f"{dataset_name} must set `load_semantic_image=true` when "
+                    "`model.semantic_history_config.enabled=true`."
+                )
+
+        if not use_history:
+            if self.accelerator.is_main_process:
+                logger.info("Qwen current-semantic adapter verified without history memory.")
+            return
+
         model_offsets = semantic_config.get("history_offsets", None)
         if model_offsets is None:
             raise ValueError(
@@ -338,15 +354,7 @@ class Wan22Trainer:
                 f"got {max_history_frames} and {len(model_offsets)}."
             )
 
-        datasets = [("train_dataset", self.train_dataset)]
-        if self.val_dataset is not None:
-            datasets.append(("val_dataset", self.val_dataset))
         for dataset_name, dataset in datasets:
-            if not bool(getattr(dataset, "load_semantic_image", False)):
-                raise ValueError(
-                    f"{dataset_name} must set `load_semantic_image=true` when "
-                    "`model.semantic_history_config.enabled=true`."
-                )
             load_history_latents = bool(getattr(dataset, "load_history_dino_latents", False))
             load_history_video = bool(getattr(dataset, "load_history_dino_video", False))
             if int(load_history_latents) + int(load_history_video) != 1:

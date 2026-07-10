@@ -1,4 +1,4 @@
-"""Qwen-VL current semantic tokens fused with short DINO history."""
+"""Qwen-VL current semantic tokens with optional short DINO-history fusion."""
 
 from __future__ import annotations
 
@@ -61,6 +61,7 @@ class QwenDINOHistoryActionAdapter(nn.Module):
         num_heads: int = 8,
         dropout: float = 0.0,
         max_history_frames: Optional[int] = None,
+        use_history: bool = True,
         vlm_family: str = "qwen3_vl",
         trust_remote_code: bool = True,
         freeze_vlm: bool = True,
@@ -70,13 +71,16 @@ class QwenDINOHistoryActionAdapter(nn.Module):
         torch_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
-        if not history_offsets:
+        self.use_history = bool(use_history)
+        if self.use_history and not history_offsets:
             raise ValueError("`semantic_history_config.history_offsets` must contain at least one frame offset.")
         self.vlm_model_name_or_path = str(vlm_model_name_or_path)
         self.vlm_family = str(vlm_family).strip().lower()
-        self.history_offsets = [int(offset) for offset in history_offsets]
-        self.max_history_frames = int(max_history_frames or max(1, len(self.history_offsets)))
-        if self.max_history_frames < len(self.history_offsets):
+        self.history_offsets = [int(offset) for offset in history_offsets] if self.use_history else []
+        self.max_history_frames = int(
+            max_history_frames or max(1, len(self.history_offsets))
+        )
+        if self.use_history and self.max_history_frames < len(self.history_offsets):
             raise ValueError(
                 "`semantic_history_config.max_history_frames` must be >= len(history_offsets), "
                 f"got {self.max_history_frames} vs {len(self.history_offsets)}."
@@ -364,10 +368,20 @@ class QwenDINOHistoryActionAdapter(nn.Module):
         *,
         prompts: str | Sequence[str],
         semantic_image: torch.Tensor,
-        history_dino_latents: torch.Tensor,
+        history_dino_latents: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         qwen_hidden, attention_mask = self.encode_qwen_hidden(prompts, semantic_image)
         qwen_tokens = self._resample_qwen(qwen_hidden, attention_mask)
+        if not self.use_history:
+            if history_dino_latents is not None:
+                raise ValueError(
+                    "`history_dino_latents` was provided although this semantic adapter has use_history=false."
+                )
+            return self.out(self.out_norm(qwen_tokens))
+        if history_dino_latents is None:
+            raise ValueError(
+                "`history_dino_latents` is required when this semantic adapter has use_history=true."
+            )
         history_tokens = self._history_tokens(history_dino_latents)
         x = qwen_tokens
         for layer in self.fusion_layers:

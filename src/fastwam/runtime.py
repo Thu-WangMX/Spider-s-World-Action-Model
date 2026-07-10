@@ -160,6 +160,86 @@ def create_fastwam(
     )
 
 
+def create_fastwam_semantic_history(
+    model_id: str,
+    tokenizer_model_id: str,
+    video_dit_config,
+    dino_config,
+    semantic_history_config,
+    tokenizer_max_len: int = 512,
+    load_text_encoder: bool = True,
+    proprio_dim: int | None = None,
+    action_dit_config=None,
+    action_dit_pretrained_path: str | None = None,
+    video_dit_pretrained_path: str | None = None,
+    skip_dit_load_from_pretrain: bool = False,
+    video_scheduler=None,
+    action_scheduler=None,
+    loss=None,
+    mot_checkpoint_mixed_attn: bool = True,
+    redirect_common_files: bool = True,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """Create the opt-in two-expert FastWAM semantic-history ablation."""
+    from .models.wan22.fastwam_semantic_history import FastWAMSemanticHistory
+
+    def to_dict(value, name: str, required: bool = False):
+        if isinstance(value, DictConfig):
+            value = OmegaConf.to_container(value, resolve=True)
+        if value is None:
+            if required:
+                raise ValueError(f"`{name}` is required for FastWAMSemanticHistory.")
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"`{name}` must resolve to a dict, got {type(value)}")
+        return value
+
+    video_dit_config = to_dict(video_dit_config, "video_dit_config", required=True)
+    dino_config = to_dict(dino_config, "dino_config", required=True)
+    semantic_history_config = to_dict(
+        semantic_history_config, "semantic_history_config", required=True
+    )
+    action_dit_config = to_dict(action_dit_config, "action_dit_config")
+    video_scheduler = to_dict(video_scheduler, "video_scheduler")
+    action_scheduler = to_dict(action_scheduler, "action_scheduler", required=True)
+    loss = to_dict(loss, "loss")
+    required_action_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
+    missing_keys = required_action_scheduler_keys - set(action_scheduler.keys())
+    if missing_keys:
+        raise ValueError(
+            f"`action_scheduler` missing required keys: {sorted(missing_keys)}. "
+            "Expected keys: train_shift, infer_shift, num_train_timesteps."
+        )
+
+    return FastWAMSemanticHistory.from_wan22_pretrained(
+        device=device,
+        torch_dtype=model_dtype,
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        tokenizer_max_len=int(tokenizer_max_len),
+        load_text_encoder=bool(load_text_encoder),
+        proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
+        redirect_common_files=bool(redirect_common_files),
+        video_dit_config=video_dit_config,
+        action_dit_config=action_dit_config,
+        action_dit_pretrained_path=action_dit_pretrained_path,
+        video_dit_pretrained_path=video_dit_pretrained_path,
+        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
+        video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
+        video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
+        video_num_train_timesteps=int(video_scheduler.get("num_train_timesteps", 1000)),
+        action_train_shift=float(action_scheduler["train_shift"]),
+        action_infer_shift=float(action_scheduler["infer_shift"]),
+        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
+        loss_lambda_video=float(loss.get("lambda_video", 1.0)),
+        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        dino_config=dino_config,
+        semantic_history_config=semantic_history_config,
+    )
+
+
 def create_fastwam_joint(
     model_id: str,
     tokenizer_model_id: str,
@@ -366,6 +446,7 @@ def create_fastwam_vae_dino_mot(
     loss=None,
     intent_config=None,
     semantic_history_config=None,
+    dino_future_mode: str = "predict",
     mot_checkpoint_mixed_attn: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
@@ -471,6 +552,7 @@ def create_fastwam_vae_dino_mot(
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         intent_config=intent_config,
         semantic_history_config=semantic_history_config,
+        dino_future_mode=str(dino_future_mode),
     )
 
 def create_fastwam_idm(
