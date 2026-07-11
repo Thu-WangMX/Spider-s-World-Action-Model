@@ -874,7 +874,8 @@ class Wan22Trainer:
         input_image = video0[:, 0].unsqueeze(0)
         _, num_frames, _, _ = video0.shape
 
-        if not hasattr(model, "infer") and hasattr(model, "infer_action"):
+        action_only_inference = bool(getattr(model, "action_only_inference", False))
+        if (action_only_inference or not hasattr(model, "infer")) and hasattr(model, "infer_action"):
             infer_kwargs = {
                 "input_image": input_image,
                 "action_horizon": sample["action_horizon"],

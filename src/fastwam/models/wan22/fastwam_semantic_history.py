@@ -23,6 +23,8 @@ class FastWAMSemanticHistory(FastWAM):
     The VAE video expert remains the original two-expert FastWAM path.
     """
 
+    action_only_inference = True
+
     def __init__(
         self,
         *args,

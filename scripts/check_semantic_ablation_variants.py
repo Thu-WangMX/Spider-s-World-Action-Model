@@ -95,8 +95,16 @@ def main() -> None:
     require("context_action" in two_mot_source, "Two-expert adapter is not action-context-only.")
     require("def infer_action" in two_mot_source, "Two-expert model lacks policy inference.")
     require(
+        "action_only_inference = True" in two_mot_source,
+        "Two-expert model must route trainer evaluation through infer_action.",
+    )
+    require(
         "Qwen current-semantic adapter verified without history memory." in trainer_source,
         "Trainer lacks the Qwen-current no-history validation path.",
+    )
+    require(
+        "action_only_inference or not hasattr(model, \"infer\")" in trainer_source,
+        "Trainer does not honor the action-only inference contract.",
     )
     require(
         "def create_fastwam_semantic_history" in runtime_source,
