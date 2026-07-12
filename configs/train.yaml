@@ -27,6 +27,8 @@ eval_every: 50
 eval_num_inference_steps: 10
 
 # training
+safe_checkpoint_serialization: false
+save_accelerate_state: true
 gradient_accumulation_steps: 1
 mixed_precision: "bf16" # one of: [no, fp16, bf16]
 seed: 42

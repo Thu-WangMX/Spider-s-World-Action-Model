@@ -48,6 +48,8 @@ class Wan22Trainer:
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
+        self.safe_checkpoint_serialization = bool(getattr(cfg, "safe_checkpoint_serialization", False))
+        self.save_accelerate_state = bool(getattr(cfg, "save_accelerate_state", True))
         self.seed = int(cfg.seed)
         
         self.resume = cfg.resume
@@ -1041,15 +1043,21 @@ class Wan22Trainer:
     def _save_weights_checkpoint(self, step_tag: str):
         model = self.accelerator.unwrap_model(self.model)
         ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
-        model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
+        model.save_checkpoint(
+            ckpt_path,
+            optimizer=None,
+            step=self.global_step,
+            safe_serialization=self.safe_checkpoint_serialization,
+        )
         return ckpt_path
 
-    def _save_trainer_state(self, state_path: str):
+    def _save_trainer_state(self, state_path: str, *, full_state: bool):
         state_file = os.path.join(state_path, "trainer_state.json")
         payload = {
             "global_step": int(self.global_step),
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
+            "full_state": bool(full_state),
         }
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
@@ -1065,16 +1073,30 @@ class Wan22Trainer:
 
         state_path = os.path.join(self.state_dir, step_tag)
         ensure_dir(state_path)
-        self.accelerator.save_state(output_dir=state_path)
+        if self.save_accelerate_state:
+            self.accelerator.save_state(output_dir=state_path)
+        elif self.accelerator.is_main_process:
+            logger.warning(
+                "Skipping Accelerate/DeepSpeed state save at step=%d; only the verified weight checkpoint is resumable.",
+                self.global_step,
+            )
         if self.accelerator.is_main_process:
-            self._save_trainer_state(state_path)
+            self._save_trainer_state(state_path, full_state=self.save_accelerate_state)
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
 
     def load_training_state(self, state_dir: str):
-        self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
+        if state_file.exists():
+            with open(state_file, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not bool(payload.get("full_state", True)):
+                raise ValueError(
+                    f"Training state at {state_dir} contains no Accelerate/DeepSpeed state. "
+                    "Resume from the corresponding weights/step_*.pt checkpoint instead."
+                )
+        self.accelerator.load_state(input_dir=state_dir)
         if state_file.exists():
             with open(state_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)

@@ -6,7 +6,10 @@ supervision.  Action tokens see only current/first-frame VAE+DINO condition
 tokens plus action tokens, never noisy future video tokens.
 """
 
+import os
+from pathlib import Path
 from typing import Any, Optional, Sequence, Union
+import zipfile
 
 import torch
 import torch.nn as nn
@@ -1694,7 +1697,37 @@ class FastWAMVAEDinoMoT(nn.Module):
 
         return {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
 
-    def save_checkpoint(self, path, optimizer=None, step=None):
+    @staticmethod
+    def _clone_checkpoint_value_to_cpu(value):
+        """Break shared tensor storage so each serialized record stays bounded."""
+        if isinstance(value, torch.Tensor):
+            return value.detach().to(device="cpu", copy=True).contiguous()
+        if isinstance(value, dict):
+            return {key: FastWAMVAEDinoMoT._clone_checkpoint_value_to_cpu(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [FastWAMVAEDinoMoT._clone_checkpoint_value_to_cpu(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(FastWAMVAEDinoMoT._clone_checkpoint_value_to_cpu(item) for item in value)
+        return value
+
+    @staticmethod
+    def _atomic_torch_save(payload, path) -> None:
+        checkpoint_path = Path(path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = checkpoint_path.with_name(f".{checkpoint_path.name}.tmp-{os.getpid()}")
+        try:
+            torch.save(payload, temporary_path)
+            with open(temporary_path, "rb") as checkpoint_file:
+                os.fsync(checkpoint_file.fileno())
+            with zipfile.ZipFile(temporary_path, "r") as archive:
+                if not archive.namelist():
+                    raise RuntimeError(f"Checkpoint archive is empty: {temporary_path}")
+            os.replace(temporary_path, checkpoint_path)
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
+
+    def save_checkpoint(self, path, optimizer=None, step=None, safe_serialization: bool = False):
         payload = {
             "mot": self.mot.state_dict(),
             "step": step,
@@ -1716,7 +1749,12 @@ class FastWAMVAEDinoMoT(nn.Module):
             payload["semantic_history_config"] = self.semantic_history_config
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
-        torch.save(payload, path)
+        if safe_serialization:
+            logger.info("Materializing independent CPU tensors for safe checkpoint serialization: %s", path)
+            payload = self._clone_checkpoint_value_to_cpu(payload)
+            self._atomic_torch_save(payload, path)
+        else:
+            torch.save(payload, path)
 
     def _validate_checkpoint_intent_config(self, checkpoint: dict[str, Any]) -> None:
         checkpoint_has_intent = "intent_encoder" in checkpoint
