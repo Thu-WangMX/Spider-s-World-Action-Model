@@ -1043,12 +1043,13 @@ class Wan22Trainer:
     def _save_weights_checkpoint(self, step_tag: str):
         model = self.accelerator.unwrap_model(self.model)
         ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
-        model.save_checkpoint(
-            ckpt_path,
-            optimizer=None,
-            step=self.global_step,
-            safe_serialization=self.safe_checkpoint_serialization,
-        )
+        save_kwargs = {
+            "optimizer": None,
+            "step": self.global_step,
+        }
+        if self.safe_checkpoint_serialization:
+            save_kwargs["safe_serialization"] = True
+        model.save_checkpoint(ckpt_path, **save_kwargs)
         return ckpt_path
 
     def _save_trainer_state(self, state_path: str, *, full_state: bool):
