@@ -1445,6 +1445,93 @@ class FastWAMVAEDinoMoT(nn.Module):
         return self.action_expert.post_dit(tokens_out["action"], action_pre)
 
     @torch.no_grad()
+    def _prefill_action_static_cache(
+        self,
+        first_frame_vae_latents: torch.Tensor,
+        first_frame_dino_latents: torch.Tensor,
+        latents_action: torch.Tensor,
+        context_video: torch.Tensor,
+        context_video_mask: torch.Tensor,
+        context_dino: torch.Tensor,
+        context_dino_mask: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, int]:
+        timestep_video = torch.zeros(
+            (first_frame_vae_latents.shape[0],),
+            dtype=first_frame_vae_latents.dtype,
+            device=self.device,
+        )
+        vae_pre = self.video_expert.pre_dit(
+            x=first_frame_vae_latents,
+            timestep=timestep_video,
+            context=context_video,
+            context_mask=context_video_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+        )
+        dino_pre = self.dino_video_expert.pre_dit(
+            x=first_frame_dino_latents,
+            timestep=timestep_video,
+            context=context_dino,
+            context_mask=context_dino_mask,
+            fuse_vae_embedding_in_latents=True,
+        )
+        vae_seq_len = int(vae_pre["tokens"].shape[1])
+        dino_seq_len = int(dino_pre["tokens"].shape[1])
+        static_seq_len = vae_seq_len + dino_seq_len
+        attention_mask = self._build_tribranch_attention_mask(
+            vae_seq_len=vae_seq_len,
+            dino_seq_len=dino_seq_len,
+            action_seq_len=int(latents_action.shape[1]),
+            vae_tokens_per_frame=int(vae_pre["meta"]["tokens_per_frame"]),
+            dino_tokens_per_frame=int(dino_pre["meta"]["tokens_per_frame"]),
+            device=vae_pre["tokens"].device,
+        )
+        static_kv_cache = self.mot.prefill_static_expert_cache(
+            static_expert_names=("video", "dino"),
+            embeds_all={"video": vae_pre["tokens"], "dino": dino_pre["tokens"]},
+            freqs_all={"video": vae_pre["freqs"], "dino": dino_pre["freqs"]},
+            t_mod_all={"video": vae_pre["t_mod"], "dino": dino_pre["t_mod"]},
+            context_all={
+                "video": {"context": vae_pre["context"], "mask": vae_pre["context_mask"]},
+                "dino": {"context": dino_pre["context"], "mask": dino_pre["context_mask"]},
+            },
+            static_attention_mask=attention_mask[:static_seq_len, :static_seq_len],
+        )
+        return static_kv_cache, attention_mask, static_seq_len
+
+    @torch.no_grad()
+    def _predict_action_noise_with_static_cache(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context_action: torch.Tensor,
+        context_action_mask: torch.Tensor,
+        static_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        static_seq_len: int,
+    ) -> torch.Tensor:
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context_action,
+            context_mask=context_action_mask,
+        )
+        action_tokens = self.mot.forward_action_with_static_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            static_kv_cache=static_kv_cache,
+            attention_mask=attention_mask,
+            static_seq_len=static_seq_len,
+        )
+        return self.action_expert.post_dit(action_tokens, action_pre)
+
+    @torch.no_grad()
     def infer_action(
         self,
         prompt: Optional[str],
@@ -1465,6 +1552,7 @@ class FastWAMVAEDinoMoT(nn.Module):
         history_video: Optional[torch.Tensor] = None,
         semantic_image: Optional[torch.Tensor] = None,
         semantic_prompt: Optional[str] = None,
+        use_static_kv_cache: bool = True,
     ) -> dict[str, Any]:
         self.eval()
         if self.intent_encoder is None and self.semantic_history_encoder is None and (
@@ -1670,6 +1758,21 @@ class FastWAMVAEDinoMoT(nn.Module):
                 intent_tokens=semantic_tokens,
             )
 
+        static_kv_cache = None
+        static_attention_mask = None
+        static_seq_len = None
+        if use_static_kv_cache:
+            static_kv_cache, static_attention_mask, static_seq_len = self._prefill_action_static_cache(
+                first_frame_vae_latents=first_frame_vae_latents,
+                first_frame_dino_latents=first_frame_dino_latents,
+                latents_action=latents_action,
+                context_video=context_video,
+                context_video_mask=context_video_mask,
+                context_dino=context_dino,
+                context_dino_mask=context_dino_mask,
+                fuse_vae_embedding_in_latents=fuse_flag,
+            )
+
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
@@ -1678,21 +1781,32 @@ class FastWAMVAEDinoMoT(nn.Module):
         )
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
-            pred_action = self._predict_action_noise(
-                first_frame_vae_latents=first_frame_vae_latents,
-                first_frame_dino_latents=first_frame_dino_latents,
-                latents_action=latents_action,
-                timestep_action=timestep_action,
-                context=context_action,
-                context_mask=context_action_mask,
-                fuse_vae_embedding_in_latents=fuse_flag,
-                context_video=context_video,
-                context_video_mask=context_video_mask,
-                context_dino=context_dino,
-                context_dino_mask=context_dino_mask,
-                context_action=context_action,
-                context_action_mask=context_action_mask,
-            )
+            if use_static_kv_cache:
+                pred_action = self._predict_action_noise_with_static_cache(
+                    latents_action=latents_action,
+                    timestep_action=timestep_action,
+                    context_action=context_action,
+                    context_action_mask=context_action_mask,
+                    static_kv_cache=static_kv_cache,
+                    attention_mask=static_attention_mask,
+                    static_seq_len=static_seq_len,
+                )
+            else:
+                pred_action = self._predict_action_noise(
+                    first_frame_vae_latents=first_frame_vae_latents,
+                    first_frame_dino_latents=first_frame_dino_latents,
+                    latents_action=latents_action,
+                    timestep_action=timestep_action,
+                    context=context_action,
+                    context_mask=context_action_mask,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                    context_video=context_video,
+                    context_video_mask=context_video_mask,
+                    context_dino=context_dino,
+                    context_dino_mask=context_dino_mask,
+                    context_action=context_action,
+                    context_action_mask=context_action_mask,
+                )
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
         return {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}

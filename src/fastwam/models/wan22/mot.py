@@ -340,6 +340,226 @@ class MoT(nn.Module):
             kv_cache.append({"k": k, "v": v})
         return kv_cache
 
+    def prefill_static_expert_cache(
+        self,
+        static_expert_names: tuple[str, ...],
+        embeds_all: Dict[str, torch.Tensor],
+        freqs_all: Dict[str, torch.Tensor],
+        t_mod_all: Dict[str, torch.Tensor],
+        context_all: Dict[str, Optional[dict]],
+        static_attention_mask: torch.Tensor,
+    ) -> list[dict[str, torch.Tensor]]:
+        """Prefill mutually interacting static experts and cache their layer K/V.
+
+        Static experts may attend to each other, but they must not depend on the
+        action branch. Their joint prefix can then be reused for every action
+        denoising step.
+        """
+        names = list(static_expert_names)
+        if not names:
+            raise ValueError("`static_expert_names` cannot be empty.")
+        if "action" in names:
+            raise ValueError("The action expert cannot be part of the static cache.")
+        if len(set(names)) != len(names):
+            raise ValueError(f"Duplicate static expert names: {names}")
+
+        unknown = [name for name in names if name not in self.mixtures]
+        if unknown:
+            raise ValueError(f"Unknown static experts: {unknown}")
+        expected_order = [name for name in self.expert_order if name in names]
+        if names != expected_order:
+            raise ValueError(
+                "Static expert order must match MoT expert order: "
+                f"got {names}, expected {expected_order}."
+            )
+
+        for field_name, values in (
+            ("embeds_all", embeds_all),
+            ("freqs_all", freqs_all),
+            ("t_mod_all", t_mod_all),
+        ):
+            missing = [name for name in names if name not in values]
+            if missing:
+                raise ValueError(f"`{field_name}` is missing static experts {missing}.")
+
+        if static_attention_mask.ndim != 2:
+            raise ValueError(
+                "`static_attention_mask` must be 2D [S,S], "
+                f"got shape {tuple(static_attention_mask.shape)}"
+            )
+        if static_attention_mask.shape[0] != static_attention_mask.shape[1]:
+            raise ValueError(
+                "`static_attention_mask` must be square, "
+                f"got shape {tuple(static_attention_mask.shape)}"
+            )
+
+        tokens_all = {name: embeds_all[name] for name in names}
+        static_seq_len = sum(int(tokens_all[name].shape[1]) for name in names)
+        if static_attention_mask.shape[0] != static_seq_len:
+            raise ValueError(
+                "Static attention mask seq length mismatch: "
+                f"mask={static_attention_mask.shape[0]} vs tokens={static_seq_len}"
+            )
+
+        kv_cache: list[dict[str, torch.Tensor]] = []
+        for layer_idx in range(self.num_layers):
+            q_chunks = []
+            k_chunks = []
+            v_chunks = []
+            layer_state = {}
+            seq_lens = []
+
+            for name in names:
+                expert = self.mixtures[name]
+                block = expert.blocks[layer_idx]
+                x = tokens_all[name]
+                (
+                    q,
+                    k,
+                    v,
+                    residual_x,
+                    gate_msa,
+                    shift_mlp,
+                    scale_mlp,
+                    gate_mlp,
+                    use_gradient_checkpointing,
+                ) = self._build_expert_attention_io(
+                    expert=expert,
+                    block=block,
+                    x=x,
+                    freqs=freqs_all[name],
+                    t_mod=t_mod_all[name],
+                )
+                q_chunks.append(q)
+                k_chunks.append(k)
+                v_chunks.append(v)
+                seq_lens.append(int(x.shape[1]))
+                layer_state[name] = {
+                    "block": block,
+                    "residual_x": residual_x,
+                    "gate_msa": gate_msa,
+                    "shift_mlp": shift_mlp,
+                    "scale_mlp": scale_mlp,
+                    "gate_mlp": gate_mlp,
+                    "use_gradient_checkpointing": use_gradient_checkpointing,
+                }
+
+            q_cat = torch.cat(q_chunks, dim=1)
+            k_cat = torch.cat(k_chunks, dim=1)
+            v_cat = torch.cat(v_chunks, dim=1)
+            mixed = self._mixed_attention(
+                q_cat=q_cat,
+                k_cat=k_cat,
+                v_cat=v_cat,
+                attention_mask=static_attention_mask,
+            )
+
+            start = 0
+            for name, seq_len in zip(names, seq_lens):
+                end = start + seq_len
+                state = layer_state[name]
+                tokens_all[name] = self._apply_post_with_optional_checkpoint(
+                    block=state["block"],
+                    residual_x=state["residual_x"],
+                    gate_msa=state["gate_msa"],
+                    shift_mlp=state["shift_mlp"],
+                    scale_mlp=state["scale_mlp"],
+                    gate_mlp=state["gate_mlp"],
+                    use_gradient_checkpointing=state["use_gradient_checkpointing"],
+                    mixed_slice=mixed[:, start:end, :],
+                    context_payload=context_all.get(name),
+                )
+                start = end
+
+            kv_cache.append({"k": k_cat, "v": v_cat})
+        return kv_cache
+
+    def forward_action_with_static_cache(
+        self,
+        action_tokens: torch.Tensor,
+        action_freqs: torch.Tensor,
+        action_t_mod: torch.Tensor,
+        action_context_payload: Optional[dict],
+        static_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        static_seq_len: int,
+    ) -> torch.Tensor:
+        """Run the action branch against a cached multi-expert static prefix."""
+        if "action" not in self.mixtures:
+            raise ValueError("MoT requires an `action` expert.")
+        if len(static_kv_cache) != self.num_layers:
+            raise ValueError(
+                f"`static_kv_cache` must contain {self.num_layers} layers, "
+                f"got {len(static_kv_cache)}."
+            )
+        if attention_mask.ndim != 2 or attention_mask.shape[0] != attention_mask.shape[1]:
+            raise ValueError(
+                "`attention_mask` must be square 2D [S,S], "
+                f"got shape {tuple(attention_mask.shape)}"
+            )
+
+        action_seq_len = int(action_tokens.shape[1])
+        total_seq_len = int(static_seq_len) + action_seq_len
+        if attention_mask.shape[0] != total_seq_len:
+            raise ValueError(
+                "Attention mask seq length mismatch: "
+                f"mask={attention_mask.shape[0]} vs expected_total={total_seq_len}"
+            )
+        action_attention_mask = attention_mask[static_seq_len:total_seq_len, :total_seq_len]
+
+        expert = self.mixtures["action"]
+        x = action_tokens
+        for layer_idx in range(self.num_layers):
+            block = expert.blocks[layer_idx]
+            (
+                q_action,
+                k_action,
+                v_action,
+                residual_x,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                use_gradient_checkpointing,
+            ) = self._build_expert_attention_io(
+                expert=expert,
+                block=block,
+                x=x,
+                freqs=action_freqs,
+                t_mod=action_t_mod,
+            )
+            layer_cache = static_kv_cache[layer_idx]
+            if "k" not in layer_cache or "v" not in layer_cache:
+                raise ValueError(
+                    f"`static_kv_cache[{layer_idx}]` must contain `k` and `v`."
+                )
+            k_static = layer_cache["k"]
+            v_static = layer_cache["v"]
+            if k_static.shape[1] != static_seq_len or v_static.shape[1] != static_seq_len:
+                raise ValueError(
+                    f"`static_kv_cache[{layer_idx}]` seq len mismatch, "
+                    f"expected {static_seq_len}."
+                )
+
+            mixed = self._mixed_attention(
+                q_cat=q_action,
+                k_cat=torch.cat([k_static, k_action], dim=1),
+                v_cat=torch.cat([v_static, v_action], dim=1),
+                attention_mask=action_attention_mask,
+            )
+            x = self._apply_post_with_optional_checkpoint(
+                block=block,
+                residual_x=residual_x,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                mixed_slice=mixed,
+                context_payload=action_context_payload,
+            )
+        return x
+
     def forward_action_with_video_cache(
         self,
         action_tokens: torch.Tensor,
